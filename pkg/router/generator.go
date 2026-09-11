@@ -266,7 +266,14 @@ func GenerateDockerCommand(cfg Config, imageName string) string {
 		port = 8000
 	}
 
+	volFlag := ""
+	if cfg.LogDir != "" {
+		volFlag = fmt.Sprintf(" -v %s:%s", cfg.LogDir, cfg.LogDir)
+	} else {
+		volFlag = " -v $(pwd)/logs:/app/logs"
+	}
+
 	args := BuildArgs(cfg)
-	return fmt.Sprintf("docker run --rm -it --network host -p %d:%d %s %s",
-		port, port, imageName, strings.Join(args, " "))
+	return fmt.Sprintf("docker run --rm -it --network host -p %d:%d%s %s %s",
+		port, port, volFlag, imageName, strings.Join(args, " "))
 }

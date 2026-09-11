@@ -582,15 +582,19 @@ $env:GOOS="linux"; $env:GOARCH="amd64"; go build -o gpu-vllm-router-linux ./cmd/
 - **GitHub 源码**：自动使用 GitHub 镜像加速拉取。
 
 ### 1. 目录文件准备
-首次从 GitHub 克隆项目后，请复制示例配置并填写自身的 GPUStack 信息：
+首次从 GitHub 克隆项目后，请复制示例配置并准备日志持久化目录：
 ```bash
-# 从示例模板创建实际配置文件 (已加入 .gitignore，不会被提交)
+# 1. 从示例模板创建实际配置文件 (已加入 .gitignore，不会被提交)
 cp config.example.yaml config.yaml
 # 编辑 config.yaml 填入 GPUStack 地址与账号密码
+
+# 2. 创建宿主机日志持久化存储目录 (确保崩溃自愈审计报告与服务日志不随容器销毁而丢失)
+mkdir -p logs
 ```
-- `Dockerfile` / `Dockerfile.cn`：全套国内加速多阶段构建文件。
-- `docker-compose.yml` / `docker-compose.cn.yml`：容器编排定义。
+- `Dockerfile` / `Dockerfile.cn` / `Dockerfile.fast.cn`：全套国内加速多阶段构建文件（预置 `/app/logs` 数据卷）。
+- `docker-compose.yml` / `docker-compose.cn.yml`：容器编排定义（挂载 `./config.yaml` 与 `./logs`）。
 - `config.yaml`：实际运行配置文件（挂载进容器）。
+- `logs/`：宿主机日志与崩溃自愈审计持久化存储目录。
 
 ### 2. 一键启动容器
 
@@ -624,15 +628,30 @@ docker compose ps
 - **原因**：Debian 官方镜像站海外连接受限或容器内 Keyring 验证异常。
 - **解决**：项目中的 `Dockerfile` 和 `Dockerfile.cn` 已预置阿里云源与 `[trusted=yes]`，无需手动配置。
 
-### 4. 配置文件热更新与重载
-`docker-compose.yml` 默认以只读方式挂载宿主机的 `./config.yaml`：
+### 4. 配置文件与日志持久化挂载
+`docker-compose.yml` 默认挂载宿主机的配置文件与日志持久化目录：
 ```yaml
 volumes:
+  # 挂载宿主机的 config.yaml 配置文件 (只读)
   - ./config.yaml:/app/config.yaml:ro
+  # 挂载日志持久化目录 (读写，持久化崩溃自愈报告 logs/crashes 与服务运行日志)
+  - ./logs:/app/logs
 ```
-当您在宿主机修改 `./config.yaml`（例如调整策略或变更模型）后，只需平滑重启容器即可生效：
+- **崩溃取证落盘**：当发生 CUDA OOM、NCCL 通信异常或持久死锁时，自愈系统生成的审计报告（`logs/crashes/<model>/<instance>_<timestamp>.log`）将直接持久化于宿主机的 `./logs/crashes/` 目录下，即便容器重启或销毁重建，现场排查数据绝不丢失。
+- **配置热重载**：当您在宿主机修改 `./config.yaml`（例如调整调度策略或增加模型覆盖规则）后，只需平滑重启容器即可生效：
 ```bash
 docker compose restart
+```
+
+#### 纯 Docker CLI 单容器直接运行：
+若不使用 Docker Compose，亦可通过 `docker run` 直接挂载配置与日志目录：
+```bash
+docker run -d --name gpu-vllm-router \
+  --restart unless-stopped \
+  -p 8000:8000 \
+  -v $(pwd)/config.yaml:/app/config.yaml:ro \
+  -v $(pwd)/logs:/app/logs \
+  gpu-vllm-router:latest
 ```
 
 ### 5. 高性能网络模式（Host Network）

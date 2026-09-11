@@ -19,6 +19,8 @@ services:
     volumes:
       # 挂载宿主机的 config.yaml 配置文件 (只读)
       - ./config.yaml:/app/config.yaml:ro
+      # 挂载日志持久化目录 (读写，持久化崩溃自愈审计报告 logs/crashes 与服务运行日志)
+      - ./logs:/app/logs
     environment:
       - TZ=Asia/Shanghai
       # 也可通过环境变量动态覆盖配置文件中的设定 (可选):

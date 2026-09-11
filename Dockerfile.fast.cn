@@ -25,6 +25,10 @@ RUN chmod +x /usr/local/bin/gpu-vllm-router
 
 COPY config.example.yaml /app/config.yaml
 
+# 创建日志持久化目录并声明数据卷
+RUN mkdir -p /app/logs
+VOLUME ["/app/logs"]
+
 EXPOSE 8000
 
 HEALTHCHECK --interval=15s --timeout=5s --start-period=10s --retries=3 \

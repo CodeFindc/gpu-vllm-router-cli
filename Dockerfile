@@ -62,6 +62,10 @@ RUN chmod +x /usr/local/bin/vllm-router /usr/local/bin/gpu-vllm-router
 # 拷贝示例配置作为容器内默认备用配置
 COPY config.example.yaml /app/config.yaml
 
+# 创建日志持久化目录并声明数据卷
+RUN mkdir -p /app/logs
+VOLUME ["/app/logs"]
+
 # 暴露对外统一服务端口 (包含 OpenAI 接口与 Swagger/ReDoc 接口文档)
 EXPOSE 8000
 

@@ -214,5 +214,14 @@ func TestBuildArgsWithPDAndAdvancedTuning(t *testing.T) {
 	if !strings.Contains(dockerCmd, "--backend sglang") {
 		t.Errorf("expected docker command to contain --backend sglang, got %s", dockerCmd)
 	}
+	if !strings.Contains(dockerCmd, "-v /var/log/vllm:/var/log/vllm") {
+		t.Errorf("expected docker command to contain custom LogDir volume mount, got %s", dockerCmd)
+	}
+
+	cfgDefaultLog := Config{Port: 8080}
+	dockerCmdDefault := GenerateDockerCommand(cfgDefaultLog, "vllm/vllm-router:latest")
+	if !strings.Contains(dockerCmdDefault, "-v $(pwd)/logs:/app/logs") {
+		t.Errorf("expected docker command with empty LogDir to contain default logs volume mount, got %s", dockerCmdDefault)
+	}
 }
 
