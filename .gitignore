@@ -1,0 +1,28 @@
+# Binaries
+*.exe
+*.exe~
+*.dll
+*.so
+*.dylib
+gpu-vllm-router.exe
+gpu-vllm-router-linux
+
+# Test binary
+*.test
+
+# Output of the go coverage tool
+*.out
+
+# IDEs and Editors
+.idea/
+.vscode/
+*.swp
+*~
+
+# OS generated files
+.DS_Store
+Thumbs.db
+
+# Local configuration with credentials
+config.yaml
+

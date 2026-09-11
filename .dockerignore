@@ -1,0 +1,9 @@
+.git
+*.exe
+*.log
+tmp/
+.vscode/
+.idea/
+node_modules/
+web/node_modules/
+web/dist/

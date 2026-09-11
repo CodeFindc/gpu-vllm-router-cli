@@ -1,0 +1,95 @@
+# ==============================================================================
+# Dockerfile.cn: 专为国内服务器优化的全套加速镜像构建文件
+# 涵盖: Debian APT 阿里云加速([trusted=yes])、Rust rsproxy 稀疏索引、Go goproxy.cn、GitHub 代理加速
+# 内置: 全集群多模型自动聚合、Swagger 交互式文档与双层熔断
+# ==============================================================================
+
+ARG REGISTRY_MIRROR=""
+FROM ${REGISTRY_MIRROR}rustlang/rust:nightly-bookworm AS vllm-router-builder
+
+# 1. 替换 Debian 官方源为阿里云镜像，加入 [trusted=yes] 解决 GPG NO_PUBKEY 签名校验报错
+RUN rm -f /etc/apt/sources.list.d/debian.sources && \
+    echo "deb [trusted=yes] http://mirrors.aliyun.com/debian/ bookworm main non-free non-free-firmware contrib" > /etc/apt/sources.list && \
+    echo "deb [trusted=yes] http://mirrors.aliyun.com/debian/ bookworm-updates main non-free non-free-firmware contrib" >> /etc/apt/sources.list && \
+    echo "deb [trusted=yes] http://mirrors.aliyun.com/debian-security/ bookworm-security main non-free non-free-firmware contrib" >> /etc/apt/sources.list && \
+    apt-get update && apt-get install -y --no-install-recommends \
+    git \
+    build-essential \
+    pkg-config \
+    libssl-dev \
+    protobuf-compiler \
+    ca-certificates \
+    && rm -rf /var/lib/apt/lists/*
+
+# 2. 配置 Rust / Cargo 国内稀疏索引加速 (字节跳动/国内社区 rsproxy.cn)
+ENV RUSTUP_DIST_SERVER=https://rsproxy.cn
+ENV RUSTUP_UPDATE_ROOT=https://rsproxy.cn/rustup
+RUN mkdir -p /root/.cargo && \
+    echo '[source.crates-io]' > /root/.cargo/config.toml && \
+    echo 'replace-with = "rsproxy-sparse"' >> /root/.cargo/config.toml && \
+    echo '[source.rsproxy-sparse]' >> /root/.cargo/config.toml && \
+    echo 'registry = "sparse+https://rsproxy.cn/index/"' >> /root/.cargo/config.toml && \
+    echo '[net]' >> /root/.cargo/config.toml && \
+    echo 'git-fetch-with-cli = true' >> /root/.cargo/config.toml
+
+# 3. 拉取官方 vllm-project/router 源码（通过加速代理）并编译 release 二进制
+ARG GH_PROXY="https://ghfast.top/"
+WORKDIR /src
+RUN git clone --depth 1 ${GH_PROXY}https://github.com/vllm-project/router.git /src/router
+WORKDIR /src/router
+RUN cargo build --release
+
+# ==============================================================================
+# 阶段 2: 编译 gpu-vllm-router (Go 调度服务 CLI，配置国内七牛云 goproxy.cn)
+# ==============================================================================
+FROM ${REGISTRY_MIRROR}golang:1.22-bookworm AS go-builder
+
+ARG GOPROXY="https://goproxy.cn,direct"
+ENV GOPROXY=${GOPROXY}
+ENV GO111MODULE=on
+
+WORKDIR /src/gpu-vllm-router
+COPY go.mod go.sum ./
+RUN go mod download
+
+COPY . .
+RUN CGO_ENABLED=0 GOOS=linux go build -ldflags="-s -w" -o /src/gpu-vllm-router/bin/gpu-vllm-router ./cmd/gpu-vllm-router
+
+# ==============================================================================
+# 阶段 3: 轻量化最小运行时镜像
+# ==============================================================================
+FROM ${REGISTRY_MIRROR}debian:bookworm-slim
+
+# 运行时同样替换为阿里云镜像
+RUN rm -f /etc/apt/sources.list.d/debian.sources && \
+    echo "deb [trusted=yes] http://mirrors.aliyun.com/debian/ bookworm main non-free non-free-firmware contrib" > /etc/apt/sources.list && \
+    echo "deb [trusted=yes] http://mirrors.aliyun.com/debian/ bookworm-updates main non-free non-free-firmware contrib" >> /etc/apt/sources.list && \
+    echo "deb [trusted=yes] http://mirrors.aliyun.com/debian-security/ bookworm-security main non-free non-free-firmware contrib" >> /etc/apt/sources.list && \
+    apt-get update && apt-get install -y --no-install-recommends \
+    ca-certificates \
+    curl \
+    libssl3 \
+    procps \
+    tzdata \
+    && rm -rf /var/lib/apt/lists/*
+
+ENV TZ=Asia/Shanghai
+WORKDIR /app
+
+# 从构建阶段提取二进制可执行文件
+COPY --from=vllm-router-builder /src/router/target/release/vllm-router /usr/local/bin/vllm-router
+COPY --from=go-builder /src/gpu-vllm-router/bin/gpu-vllm-router /usr/local/bin/gpu-vllm-router
+
+RUN chmod +x /usr/local/bin/vllm-router /usr/local/bin/gpu-vllm-router
+
+# 拷贝示例配置作为备用
+COPY config.example.yaml /app/config.yaml
+
+# 暴露对外统一服务端口 (包含 OpenAI 接口与 Swagger/ReDoc 接口文档)
+EXPOSE 8000
+
+HEALTHCHECK --interval=15s --timeout=5s --start-period=10s --retries=3 \
+    CMD curl -f http://localhost:8000/health || exit 1
+
+ENTRYPOINT ["/usr/local/bin/gpu-vllm-router"]
+CMD ["-config", "/app/config.yaml"]

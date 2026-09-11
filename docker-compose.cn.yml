@@ -1,0 +1,41 @@
+version: "3.8"
+
+services:
+  gpu-vllm-router:
+    build:
+      context: .
+      dockerfile: Dockerfile.cn
+      args:
+        # 国内镜像代理前缀 (如果本地已配置 /etc/docker/daemon.json 镜像源可留空)
+        REGISTRY_MIRROR: ""
+        # GitHub 仓库加速代理
+        GH_PROXY: "https://ghfast.top/"
+        # Go 语言国内代理
+        GOPROXY: "https://goproxy.cn,direct"
+    image: gpu-vllm-router:latest
+    container_name: gpu-vllm-router
+    restart: unless-stopped
+    ports:
+      - "8000:8000"
+    # 高性能 GPU 集群场景下若需极低网络开销，可开启 host 网络模式：
+    # network_mode: "host"
+    volumes:
+      # 挂载宿主机的 config.yaml 配置文件 (只读)
+      - ./config.yaml:/app/config.yaml:ro
+    environment:
+      - TZ=Asia/Shanghai
+      # 也可通过环境变量动态覆盖配置文件中的设定 (可选):
+      # - GPUSTACK_BASE_URL=http://<GPUSTACK_HOST>:8200
+      # - GPUSTACK_USERNAME=admin
+      # - GPUSTACK_PASSWORD=your_password_here
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:8000/health"]
+      interval: 15s
+      timeout: 5s
+      retries: 3
+      start_period: 10s
+    logging:
+      driver: "json-file"
+      options:
+        max-size: "50m"
+        max-file: "5"

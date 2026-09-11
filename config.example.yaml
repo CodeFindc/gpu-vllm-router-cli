@@ -1,0 +1,203 @@
+# ==============================================================================
+# GPUStack 与 vLLM-Router 动态实例调度与网关服务完整配置文件
+# 
+# 支持运行模式:
+#   - proxy: (默认推荐) Go 原生 OpenAI 兼容高可用代理网关，全集群多模型自动聚合路由，内置双层熔断与故障转移
+#   - run:   守护官方 Rust 版 vllm-router 双进程热重载实例池
+#   - cmd:   仅服务发现 GPUStack 实例并生成官方启动命令 (Bash / PowerShell / Docker)
+# ==============================================================================
+
+# ------------------------------------------------------------------------------
+# 1. GPUStack 集群连接配置
+# ------------------------------------------------------------------------------
+gpustack:
+  base_url: "http://<GPUSTACK_HOST>:8200" # GPUStack 控制面 API 地址 (例如 http://192.168.1.100:8200)
+  username: "admin"                      # 登录用户名
+  password: "your_password_here"         # 登录密码 (或使用环境变量 GPUSTACK_PASSWORD)
+  api_key: ""                            # GPUStack API Key (若已配置 API Key 可留空用户名密码)
+  timeout: 10s                           # GPUStack API 请求超时时间
+
+# ------------------------------------------------------------------------------
+# 2. 全局目标模型与负载均衡调度策略
+# ------------------------------------------------------------------------------
+target:
+  # 留空代表开启【全集群多模型自动纳管模式】:
+  # 自动感知并同步 GPUStack 上所有处于 running 状态的模型与实例，动态聚合对外暴露统一端点。
+  # 若需为某个关键高吞吐模型单独启动专用路由，可在此填写具体模型名 (如 "DeepSeek-V4-Flash-0731-w8a8")。
+  model_name: ""
+
+  # 全局默认负载均衡调度策略:
+  # - consistent_hash: 一致性哈希，根据会话 (X-Session-ID / X-User-ID) 绑定 Worker，实现多轮对话上下文与 KV 缓存复用
+  # - cache_aware:     前缀缓存感知优化路由（官方推荐，根据请求前缀命中率结合实例负载动态选择最佳 Worker）
+  # - round_robin:     简单轮询，适用于无状态、短会话、请求大小均等的推理场景
+  # - power_of_two:    P2C 算法，随机在两台 Worker 中挑选活跃连接数较少的一台
+  # - random:          纯随机负载分发
+  # - rendezvous_hash: 最高随机权重哈希 (HRW)，节点增删时节点迁移量最小，缓存抖动最小
+  policy: "consistent_hash"
+
+# ------------------------------------------------------------------------------
+# 3. 核心路由器服务与运行环境配置
+# ------------------------------------------------------------------------------
+router:
+  # 运行模式: proxy (内置Go网关), run (守护官方vllm-router), cmd (仅输出命令)
+  mode: "proxy"
+
+  # 服务对外监听地址与端口
+  host: "0.0.0.0"
+  port: 8000
+
+  # 官方 vllm-router 可执行文件路径 (run / cmd 模式下使用)
+  router_bin: "vllm-router"
+
+  # 后端推理引擎类型 (对应官方 --backend 参数: vllm, sglang, trtllm, openai, anthropic)
+  backend: "vllm"
+
+  # 路由器日志输出级别 (对应官方 --log-level: debug, info, warn, error)
+  log_level: "info"
+
+  # 路由器日志保存目录 (可选，对应官方 --log-dir)
+  # log_dir: "/var/log/vllm-router"
+
+  # 后台定时轮询 GPUStack 感知实例增删与节点状态变化的间隔
+  watch_interval: 10s
+
+  # 数据并行度 Intra-node data parallel size (对应官方 --intra-node-data-parallel-size)
+  # 当 > 1 时，路由器将为每个 Worker URL 分配相应数量的数据并行副本
+  data_parallel_size: 1
+
+  # run 模式蓝绿双进程零停机平滑滚动热重载配置
+  zero_downtime: true
+  drain_timeout: 60s                     # 滚动重载时给旧进程排空现有长连接请求的最大等待时间
+
+# ------------------------------------------------------------------------------
+# 4. 前缀缓存感知 (Cache-Aware) 与负载均衡高阶微调参数
+# ------------------------------------------------------------------------------
+  # 负载绝对差均衡阈值 (对应官方 --balance-abs-threshold)
+  # 在 cache_aware 策略下，当不同 Worker 的负载绝对差超过此阈值时，优先平衡负载而非强求前缀匹配
+  balance_abs_threshold: 64
+
+  # 负载相对比均衡阈值 (对应官方 --balance-rel-threshold)
+  # 在 cache_aware 策略下，当 Worker 间负载相对比超过此比例时触发负载平衡
+  balance_rel_threshold: 1.5
+
+  # 前缀缓存命中复用匹配阈值 (对应官方 --cache-threshold，取值范围 0.0 ~ 1.0)
+  # 只有当请求前缀与某个 Worker 的缓存匹配率超过此阈值时，才路由到该 Worker 复用 KV Cache
+  cache_threshold: 0.3
+
+  # 缓存近似树淘汰操作周期秒数 (对应官方 --eviction-interval，默认 120)
+  eviction_interval: 120
+
+  # 缓存感知路由近似树的最大容量节点数 (对应官方 --max-tree-size，默认 67108864)
+  max_tree_size: 67108864
+
+  # 最大单请求体载荷字节数限制 (对应官方 --max-payload-size，默认 536870912 即 512MB)
+  max_payload_size: 536870912
+
+# ------------------------------------------------------------------------------
+# 5. Prefill-Decode (PD) 两阶段分离部署路由参数 (可选高级功能)
+# ------------------------------------------------------------------------------
+  # 是否开启 vLLM PD Prefill-Decode 两阶段解耦分离路由模式 (对应官方 --vllm-pd-disaggregation)
+  vllm_pd_disaggregation: false
+
+  # ZMQ 服务发现协调地址，用于各 Worker 自动注册 HTTP 与 ZMQ 通信地址 (对应官方 --vllm-discovery-address)
+  # 例如: "0.0.0.0:30001"
+  # vllm_discovery_address: "0.0.0.0:30001"
+
+  # PD 模式下 Prefill 节点专用的调度策略 (对应官方 --prefill-policy)
+  # prefill_policy: "cache_aware"
+
+  # PD 模式下 Decode 节点专用的调度策略 (对应官方 --decode-policy)
+  # decode_policy: "power_of_two"
+
+  # 静态指定的 Prefill 节点列表 (静态模式生效，对应 --prefill <url>)
+  # prefill_urls:
+  #   - "http://192.168.1.20:8000"
+
+  # 静态指定的 Decode 节点列表 (静态模式生效，对应 --decode <url>)
+  # decode_urls:
+  #   - "http://192.168.1.21:8000"
+
+# ------------------------------------------------------------------------------
+# 6. Worker 实例就绪等待与健康探测控制
+# ------------------------------------------------------------------------------
+  # 首次启动或节点上线时等待 Worker 就绪的最长超时时间秒数 (对应官方 --worker-startup-timeout-secs)
+  worker_startup_timeout_secs: 600
+
+  # Worker 启动状态轮询探测周期秒数 (对应官方 --worker-startup-check-interval)
+  worker_startup_check_interval: 30
+
+# ------------------------------------------------------------------------------
+# 7. 安全认证与后端授权 (可选)
+# ------------------------------------------------------------------------------
+  # 转发给后端 Worker 节点的鉴权 API Key (对应官方 --api-key)
+  # api_key: "sk-worker-secret-key"
+
+  # API Key 客户端校验服务地址列表 (对应官方 --api-key-validation-urls)
+  # api_key_validation_urls:
+  #   - "http://auth-service.internal:8080/validate"
+
+# ------------------------------------------------------------------------------
+# 8. 自由透传额外官方 CLI 命令行参数
+# ------------------------------------------------------------------------------
+  # 当官方 vllm-router 发布更新标志或需要配置未列出的自定义参数时，可在本数组中直接追加
+  # extra_args:
+  #   - "--log-stats"
+  #   - "--request-stats-window"
+  #   - "60"
+
+# ------------------------------------------------------------------------------
+# 9. 双层高可用熔断器 (Circuit Breaker) 与透明故障转移配置
+# ------------------------------------------------------------------------------
+circuit_breaker:
+  # 是否开启主动健康熔断与失败重试机制
+  enabled: true
+
+  # 连续请求失败达到此阈值后立即触发熔断隔离 (State: OPEN) (对齐官方 --cb-failure-threshold)
+  max_failures: 3
+
+  # 半开试探阶段所需的连续成功次数以恢复健康 (State: CLOSED) (对齐官方 --cb-success-threshold)
+  success_threshold: 2
+
+  # 熔断隔离冷却等待时长，到期后进入半开试探 (State: HALF_OPEN) (对齐官方 --cb-timeout-duration-secs)
+  cooldown: 10s
+
+  # 故障统计滑动时间窗口 (对齐官方 --cb-window-duration-secs)
+  window_duration: 60s
+
+  # 单个请求遭遇节点宕机/异常时的自动透明重试转移次数 (对齐官方 --retry-max-retries)
+  max_retries: 2
+
+  # 重试初始退避时长 (对齐官方 --retry-initial-backoff-ms)
+  retry_initial_backoff: 50ms
+
+  # 后台主动健康探测心跳周期 (对齐官方 --health-check-interval-secs 与 Supervisor 嗅探周期)
+  health_check_interval: 3s
+
+  # 单次健康探测超时时长 (对齐官方 --health-check-timeout-secs)
+  health_check_timeout: 5s
+
+  # Worker 健康检查路径 (对应官方 --health-check-endpoint)
+  health_check_endpoint: "/health"
+
+# ------------------------------------------------------------------------------
+# 10. 多模型差异化独立覆盖规则 (Per-Model Override Rules)
+# ------------------------------------------------------------------------------
+# 在全集群自动同步模式下，所有模型默认继承上方的全局配置。
+# 若有特定模型需要专属调度策略、特定缓存阈值或不同运行模式，可在下方列表中单独声明覆盖：
+# models:
+#   # 示例 1: 长文本 / 对话助手模型，强化前缀缓存命中，使用 cache_aware 策略
+#   - model_name: "DeepSeek-V4-Flash-0731-w8a8"
+#     mode: "proxy"
+#     policy: "cache_aware"
+#     cache_threshold: 0.6
+#     balance_abs_threshold: 32
+#     balance_rel_threshold: 1.2
+#
+#   # 示例 2: 短推理 / 吞吐模型，使用 P2C 负载敏感轮询，由官方 run 守护进程托管
+#   - model_name: "Qwen3.6-27B"
+#     mode: "run"
+#     policy: "power_of_two"
+#     extra_args:
+#       - "--worker-startup-timeout-secs"
+#       - "300"
+
