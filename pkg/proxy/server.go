@@ -310,8 +310,27 @@ func (s *Server) director(req *http.Request) {
 	}
 
 	if pool.Mode == "run" && pool.RunnerTarget != nil {
-		log.Printf("[Proxy:Route] 🔀 [Model: %s] [Mode: run] %s %s -> vllm-router (%s)",
-			pool.ModelName, req.Method, req.URL.Path, pool.RunnerTarget.String())
+		var workerDescs []string
+		s.endpointsMu.RLock()
+		for _, t := range pool.Targets {
+			u := t.URLString
+			meta, has := s.endpointsMeta[u]
+			if has && meta.WorkerName != "" {
+				workerDescs = append(workerDescs, fmt.Sprintf("%s (%s)", u, meta.WorkerName))
+			} else {
+				workerDescs = append(workerDescs, u)
+			}
+		}
+		s.endpointsMu.RUnlock()
+
+		if len(pool.Targets) == 1 && len(workerDescs) > 0 {
+			log.Printf("[Proxy:Route] 🚀 [Model: %s] [Policy: %s] %s %s -> Worker: %s (Mode: run)",
+				pool.ModelName, pool.Policy, req.Method, req.URL.Path, workerDescs[0])
+		} else {
+			log.Printf("[Proxy:Route] 🔀 [Model: %s] [Policy: %s] %s %s -> vllm-router (%s) | Workers: [%s]",
+				pool.ModelName, pool.Policy, req.Method, req.URL.Path, pool.RunnerTarget.String(), strings.Join(workerDescs, ", "))
+		}
+
 		req.URL.Scheme = pool.RunnerTarget.Scheme
 		req.URL.Host = pool.RunnerTarget.Host
 		req.Host = pool.RunnerTarget.Host
@@ -376,6 +395,21 @@ func (s *Server) modifyResponse(resp *http.Response) error {
 	resp.Header.Set("X-Router-Policy", string(s.cfg.Policy))
 	if m, ok := ctx.Value("routed_model").(string); ok && m != "" {
 		resp.Header.Set("X-Routed-Model", m)
+	}
+
+	workerURL := resp.Header.Get("x-vllm-router-worker")
+	if workerURL == "" {
+		workerURL = resp.Header.Get("X-Vllm-Router-Worker")
+	}
+	if workerURL != "" {
+		s.endpointsMu.RLock()
+		meta, ok := s.endpointsMeta[workerURL]
+		s.endpointsMu.RUnlock()
+		instDesc := ""
+		if ok && meta.WorkerName != "" {
+			instDesc = fmt.Sprintf(" (Worker: %s, Instance: %s)", meta.WorkerName, meta.InstanceName)
+		}
+		log.Printf("[Proxy:Route] 🎯 Real Worker: %s%s (Status: %d)", workerURL, instDesc, resp.StatusCode)
 	}
 	return nil
 }

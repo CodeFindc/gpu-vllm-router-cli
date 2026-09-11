@@ -803,10 +803,29 @@ func (s *Supervisor) handleProxy(w http.ResponseWriter, req *http.Request) {
 	atomic.AddInt64(&runner.activeConns, 1)
 	defer atomic.AddInt64(&runner.activeConns, -1)
 
+	var workerDescs []string
+	s.endpointsMu.RLock()
+	for _, u := range activeURLs {
+		meta, has := s.endpointsMeta[u]
+		if has && meta.WorkerName != "" {
+			workerDescs = append(workerDescs, fmt.Sprintf("%s (%s)", u, meta.WorkerName))
+		} else {
+			workerDescs = append(workerDescs, u)
+		}
+	}
+	s.endpointsMu.RUnlock()
+
+	workersSummary := strings.Join(workerDescs, ", ")
+
 	proxy := &httputil.ReverseProxy{
 		Director: func(r *http.Request) {
-			log.Printf("[Supervisor:Route] 🔀 [Model: %s] [Mode: run] %s %s -> vllm-router (%s) (ActiveConns: %d)",
-				runner.ModelName, r.Method, r.URL.Path, target.String(), atomic.LoadInt64(&runner.activeConns))
+			if len(activeURLs) == 1 {
+				log.Printf("[Supervisor:Route] 🚀 [Model: %s] [Policy: %s] %s %s -> Worker: %s (ActiveConns: %d)",
+					runner.ModelName, runner.Policy, r.Method, r.URL.Path, workersSummary, atomic.LoadInt64(&runner.activeConns))
+			} else {
+				log.Printf("[Supervisor:Route] 🔀 [Model: %s] [Policy: %s] %s %s -> vllm-router (%s) | Workers: [%s] (ActiveConns: %d)",
+					runner.ModelName, runner.Policy, r.Method, r.URL.Path, target.String(), workersSummary, atomic.LoadInt64(&runner.activeConns))
+			}
 			r.URL.Scheme = target.Scheme
 			r.URL.Host = target.Host
 			r.Host = target.Host
@@ -815,6 +834,24 @@ func (s *Supervisor) handleProxy(w http.ResponseWriter, req *http.Request) {
 			}
 		},
 		FlushInterval: 10 * time.Millisecond,
+		ModifyResponse: func(resp *http.Response) error {
+			workerURL := resp.Header.Get("x-vllm-router-worker")
+			if workerURL == "" {
+				workerURL = resp.Header.Get("X-Vllm-Router-Worker")
+			}
+			if workerURL != "" {
+				s.endpointsMu.RLock()
+				meta, ok := s.endpointsMeta[workerURL]
+				s.endpointsMu.RUnlock()
+				instDesc := ""
+				if ok && meta.WorkerName != "" {
+					instDesc = fmt.Sprintf(" (Worker: %s, Instance: %s)", meta.WorkerName, meta.InstanceName)
+				}
+				log.Printf("[Supervisor:Route] 🎯 [Model: %s] [Policy: %s] Real Worker: %s%s (Status: %d)",
+					runner.ModelName, runner.Policy, workerURL, instDesc, resp.StatusCode)
+			}
+			return nil
+		},
 		ErrorHandler: func(rw http.ResponseWriter, r *http.Request, err error) {
 			if errors.Is(err, context.Canceled) || errors.Is(r.Context().Err(), context.Canceled) {
 				log.Printf("[Supervisor:Proxy] Client canceled/disconnected request for model %s (Queue timeout or User abort)", runner.ModelName)
