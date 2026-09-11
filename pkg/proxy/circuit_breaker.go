@@ -50,6 +50,7 @@ type CircuitBreaker struct {
 	totalFailures       int64
 	totalSuccesses      int64
 	lastStateChange     time.Time
+	openSince           time.Time
 	lastFailureTime     time.Time
 	lastProbeTime       time.Time
 	lastError           string
@@ -120,6 +121,7 @@ func (cb *CircuitBreaker) RecordSuccess() {
 	if cb.state == StateHalfOpen || cb.state == StateOpen {
 		cb.state = StateClosed
 		cb.lastStateChange = time.Now()
+		cb.openSince = time.Time{} // Reset continuous open tracking only when fully healthy
 		log.Printf("[CircuitBreaker] 🟢 Target %s healthy! Restored to CLOSED", cb.targetURL)
 	}
 }
@@ -142,6 +144,7 @@ func (cb *CircuitBreaker) RecordFailure(err error) {
 		// Half-open trial failed, immediate trip back to Open
 		cb.state = StateOpen
 		cb.lastStateChange = time.Now()
+		// DO NOT reset openSince! Preserve initial failure time across half-open trials
 		log.Printf("[CircuitBreaker] Target %s failed during HALF_OPEN trial -> back to OPEN (isolated for %v)",
 			cb.targetURL, cb.cfg.Cooldown)
 		return
@@ -150,16 +153,31 @@ func (cb *CircuitBreaker) RecordFailure(err error) {
 	if cb.state == StateClosed && cb.consecutiveFailures >= cb.cfg.MaxFailures {
 		cb.state = StateOpen
 		cb.lastStateChange = time.Now()
+		cb.openSince = time.Now() // Lock the initial trip timestamp
 		log.Printf("[CircuitBreaker] 🔴 Target %s reached %d consecutive failures -> TRIPPED OPEN! Node isolated for %v",
 			cb.targetURL, cb.consecutiveFailures, cb.cfg.Cooldown)
 	}
 }
 
-// GetStatus returns the current status snapshot of the circuit breaker.
-func (cb *CircuitBreaker) GetStatus() (state CircuitState, consecutiveFails int, lastChange time.Time) {
+// GetStatus returns the current status snapshot of the circuit breaker with continuous open time.
+func (cb *CircuitBreaker) GetStatus() (state CircuitState, consecutiveFails int, openSince time.Time) {
 	cb.mu.RLock()
 	defer cb.mu.RUnlock()
-	return cb.state, cb.consecutiveFailures, cb.lastStateChange
+	return cb.state, cb.consecutiveFailures, cb.openSince
+}
+
+// GetOpenSince returns when the circuit breaker continuously entered OPEN state.
+func (cb *CircuitBreaker) GetOpenSince() time.Time {
+	cb.mu.RLock()
+	defer cb.mu.RUnlock()
+	return cb.openSince
+}
+
+// GetLastStateChange returns the timestamp of the last state transition.
+func (cb *CircuitBreaker) GetLastStateChange() time.Time {
+	cb.mu.RLock()
+	defer cb.mu.RUnlock()
+	return cb.lastStateChange
 }
 
 // GetMetrics returns detailed execution counters for Prometheus export.

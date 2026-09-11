@@ -11,6 +11,7 @@ import (
 	"net/http"
 	"net/http/httputil"
 	"net/url"
+	"os"
 	"os/exec"
 	"sort"
 	"strings"
@@ -309,6 +310,8 @@ func (s *Server) director(req *http.Request) {
 	}
 
 	if pool.Mode == "run" && pool.RunnerTarget != nil {
+		log.Printf("[Proxy:Route] 🔀 [Model: %s] [Mode: run] %s %s -> vllm-router (%s)",
+			pool.ModelName, req.Method, req.URL.Path, pool.RunnerTarget.String())
 		req.URL.Scheme = pool.RunnerTarget.Scheme
 		req.URL.Host = pool.RunnerTarget.Host
 		req.Host = pool.RunnerTarget.Host
@@ -330,6 +333,18 @@ func (s *Server) director(req *http.Request) {
 
 	// Record start of request for active connection tracking
 	pool.Balancer.RecordRequestStart(target)
+
+	// Fetch endpoint metadata for instance/worker name
+	s.endpointsMu.RLock()
+	epMeta, hasMeta := s.endpointsMeta[target.URLString]
+	s.endpointsMu.RUnlock()
+	instDesc := ""
+	if hasMeta && epMeta.WorkerName != "" {
+		instDesc = fmt.Sprintf(" (Worker: %s, Instance: %s)", epMeta.WorkerName, epMeta.InstanceName)
+	}
+
+	log.Printf("[Proxy:Route] 🚀 [Model: %s] [Policy: %s] %s %s -> %s%s (ActiveConns: %d)",
+		pool.ModelName, pool.Policy, req.Method, req.URL.Path, target.URLString, instDesc, atomic.LoadInt64(&target.ActiveConns))
 
 	// Save routeState in context for retryTransport, modifyResponse, and errorHandler
 	state := &routeState{
@@ -544,6 +559,14 @@ func (s *Server) pruneEndpointsMeta(activeURLs []string) {
 	defer s.endpointsMu.Unlock()
 	for u := range s.endpointsMeta {
 		if !activeSet[u] {
+			// Retain metadata if target is currently open or half-open so auto-healer can heal it
+			target := s.findExistingTarget(u)
+			if target != nil && target.CircuitBreaker != nil {
+				st, _, _ := target.CircuitBreaker.GetStatus()
+				if st == StateOpen || st == StateHalfOpen {
+					continue
+				}
+			}
 			delete(s.endpointsMeta, u)
 		}
 	}
@@ -729,29 +752,34 @@ func (s *Server) probeLoop(ctx context.Context) {
 				if t.CircuitBreaker == nil {
 					continue
 				}
-				state, _, _ := t.CircuitBreaker.GetStatus()
+				state, _, openSince := t.CircuitBreaker.GetStatus()
 				if state == StateOpen || state == StateHalfOpen {
-					go func(target *BackendTarget) {
+					go func(target *BackendTarget, oSince time.Time) {
 						if target.CircuitBreaker.Probe() {
 							log.Printf("[Proxy:Probe] 🟢 Target %s self-healing probe succeeded! Restored to CLOSED", target.URLString)
-						} else if s.autoHealer != nil {
-							_, _, openSince := target.CircuitBreaker.GetStatus()
-							_, lastErr := target.CircuitBreaker.GetLastProbeAndError()
-							if shouldRestart, reason := s.autoHealer.ShouldRestart(openSince, lastErr); shouldRestart {
+							if s.autoHealer != nil {
 								s.endpointsMu.RLock()
 								ep, hasMeta := s.endpointsMeta[target.URLString]
 								s.endpointsMu.RUnlock()
 								if hasMeta && ep.InstanceID > 0 {
-									crashPath, rErr := s.autoHealer.TriggerIncidentRestart(context.Background(), ep, reason, lastErr)
-									if rErr != nil {
-										log.Printf("[Proxy:AutoHeal] ❌ Auto-heal failed for %s (ID: %d): %v", ep.InstanceName, ep.InstanceID, rErr)
-									} else if crashPath != "" {
-										log.Printf("[Proxy:AutoHeal] 🚀 Auto-heal initiated for %s (ID: %d). Crash report saved to %s", ep.InstanceName, ep.InstanceID, crashPath)
-									}
+									s.autoHealer.ResetAttempts(ep.InstanceID)
+								}
+							}
+						} else if s.autoHealer != nil {
+							s.endpointsMu.RLock()
+							ep, hasMeta := s.endpointsMeta[target.URLString]
+							s.endpointsMu.RUnlock()
+							if hasMeta && ep.InstanceID > 0 {
+								_, lastErr := target.CircuitBreaker.GetLastProbeAndError()
+								crashPath, rErr := s.autoHealer.EvaluateAndTrigger(context.Background(), ep, oSince, lastErr)
+								if rErr != nil {
+									log.Printf("[Proxy:AutoHeal] ❌ Auto-heal failed for %s (ID: %d): %v", ep.InstanceName, ep.InstanceID, rErr)
+								} else if crashPath != "" {
+									log.Printf("[Proxy:AutoHeal] 🚀 Auto-heal initiated for %s (ID: %d). Crash report saved to %s", ep.InstanceName, ep.InstanceID, crashPath)
 								}
 							}
 						}
-					}(t)
+					}(t, openSince)
 				}
 			}
 		}
@@ -1357,12 +1385,28 @@ func (s *Server) startRunnerForPool(pool *ModelPool, urls []string) error {
 		CacheThreshold:      cacheThresh,
 		ExtraArgs:           extraArgs,
 	}
+	if pool.Policy == router.PolicyCacheAware {
+		cfg.LogLevel = "debug"
+	}
 	args := router.BuildArgs(cfg)
 	cmd := exec.Command("vllm-router", args...)
+	cmd.Env = append(os.Environ(), "RUST_LOG=vllm_router=debug,info")
+
+	stdout, _ := cmd.StdoutPipe()
+	stderr, _ := cmd.StderrPipe()
 	if err := cmd.Start(); err != nil {
 		log.Printf("[Proxy] Failed to start vllm-router for [%s]: %v", pool.ModelName, err)
 		return err
 	}
+
+	prefix := fmt.Sprintf("[vllm-router:%d]", freePort)
+	if stdout != nil {
+		go router.StreamPipe(stdout, prefix)
+	}
+	if stderr != nil {
+		go router.StreamPipe(stderr, prefix)
+	}
+
 	s.mu.Lock()
 	pool.RunnerCmd = cmd
 	pool.RunnerPort = freePort

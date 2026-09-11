@@ -6,11 +6,13 @@ import (
 	"errors"
 	"hash/fnv"
 	"io"
+	"log"
 	"math/rand"
 	"net/http"
 	"net/url"
 	"sort"
 	"strconv"
+	"strings"
 	"sync"
 	"sync/atomic"
 
@@ -263,6 +265,8 @@ func (b *ConsistentHashBalancer) SelectTargetExcluding(r *http.Request, excluded
 			continue
 		}
 		if target.CircuitBreaker == nil || target.CircuitBreaker.CanExecute() {
+			log.Printf("[Balancer:ConsistentHash] 🎯 Routed to worker %s (Active: %d) | SessionKey: %q (hash=0x%08x)",
+				target.URLString, atomic.LoadInt64(&target.ActiveConns), key, h)
 			return target, nil
 		}
 	}
@@ -391,8 +395,8 @@ func (b *CacheAwareBalancer) SelectTargetExcluding(r *http.Request, excluded map
 		return nil, errors.New("no backends available in pool")
 	}
 
-	key := extractCacheAwareKey(r)
-	h := hashKey(key)
+	info := extractCacheAwareKeyInfo(r)
+	h := info.Hash
 
 	startIdx := sort.Search(len(b.ring), func(i int) bool { return b.ring[i] >= h })
 	if startIdx >= len(b.ring) {
@@ -409,6 +413,8 @@ func (b *CacheAwareBalancer) SelectTargetExcluding(r *http.Request, excluded map
 			continue
 		}
 		if target.CircuitBreaker == nil || target.CircuitBreaker.CanExecute() {
+			log.Printf("[Balancer:CacheAware] 🎯 Routed to %s (Active: %d) | Key: [%s] hash=0x%08x len=%d sample=%q",
+				target.URLString, atomic.LoadInt64(&target.ActiveConns), info.Source, info.Hash, info.KeyLength, info.KeyPreview)
 			return target, nil
 		}
 	}
@@ -419,37 +425,154 @@ func (b *CacheAwareBalancer) SelectTargetExcluding(r *http.Request, excluded map
 	return nil, errors.New("all backends on cache-aware ring are currently isolated by circuit breaker (OPEN)")
 }
 
-func extractCacheAwareKey(r *http.Request) string {
+// CacheAwareKeyInfo holds detailed cache matching information for logging and routing analysis.
+type CacheAwareKeyInfo struct {
+	Source     string // "prompt", "prompt_list", "chat_prefix", "header:X-Session-ID", "json_session", "remote_addr"
+	RawKey     string
+	KeyPreview string // Short preview for log output
+	KeyLength  int    // Original text length
+	Hash       uint32
+}
+
+func extractCacheAwareKeyInfo(r *http.Request) CacheAwareKeyInfo {
+	if r == nil {
+		return CacheAwareKeyInfo{Source: "none", RawKey: "none", KeyPreview: "none", Hash: hashKey("none")}
+	}
+
 	// Try to extract prompt prefix from JSON body if present
 	if r.Body != nil && (r.Method == http.MethodPost || r.Method == http.MethodPut) {
 		bodyBytes, err := io.ReadAll(r.Body)
 		if err == nil {
+			// Restore request body for downstream handlers
 			r.Body = io.NopCloser(bytes.NewReader(bodyBytes))
+			r.GetBody = func() (io.ReadCloser, error) {
+				return io.NopCloser(bytes.NewReader(bodyBytes)), nil
+			}
 
 			var reqMap map[string]interface{}
 			if err := json.Unmarshal(bodyBytes, &reqMap); err == nil {
-				// 1. Check prompt string
-				if prompt, ok := reqMap["prompt"].(string); ok && prompt != "" {
-					if len(prompt) > 256 {
-						prompt = prompt[:256]
+				// 1. Check prompt string or prompt array
+				if promptStr, ok := reqMap["prompt"].(string); ok && promptStr != "" {
+					origLen := len(promptStr)
+					preview := promptStr
+					if len(preview) > 60 {
+						preview = preview[:60] + "..."
 					}
-					return "prompt:" + prompt
+					prefix := promptStr
+					if len(prefix) > 256 {
+						prefix = prefix[:256]
+					}
+					rawKey := "prompt:" + prefix
+					return CacheAwareKeyInfo{
+						Source:     "prompt",
+						RawKey:     rawKey,
+						KeyPreview: preview,
+						KeyLength:  origLen,
+						Hash:       hashKey(rawKey),
+					}
+				} else if promptList, ok := reqMap["prompt"].([]interface{}); ok && len(promptList) > 0 {
+					if firstP, ok := promptList[0].(string); ok && firstP != "" {
+						origLen := len(firstP)
+						preview := firstP
+						if len(preview) > 60 {
+							preview = preview[:60] + "..."
+						}
+						prefix := firstP
+						if len(prefix) > 256 {
+							prefix = prefix[:256]
+						}
+						rawKey := "prompt:" + prefix
+						return CacheAwareKeyInfo{
+							Source:     "prompt_list",
+							RawKey:     rawKey,
+							KeyPreview: preview,
+							KeyLength:  origLen,
+							Hash:       hashKey(rawKey),
+						}
+					}
 				}
+
 				// 2. Check messages array for chat completions
 				if msgs, ok := reqMap["messages"].([]interface{}); ok && len(msgs) > 0 {
-					if firstMsg, ok := msgs[0].(map[string]interface{}); ok {
-						if content, ok := firstMsg["content"].(string); ok && content != "" {
-							if len(content) > 256 {
-								content = content[:256]
+					var prefixBuf strings.Builder
+					var totalLen int
+					for i := 0; i < len(msgs) && i < 2; i++ {
+						msgMap, ok := msgs[i].(map[string]interface{})
+						if !ok {
+							continue
+						}
+						role, _ := msgMap["role"].(string)
+						var text string
+						if contentStr, ok := msgMap["content"].(string); ok {
+							text = contentStr
+						} else if parts, ok := msgMap["content"].([]interface{}); ok {
+							for _, p := range parts {
+								if pMap, ok := p.(map[string]interface{}); ok {
+									if pType, _ := pMap["type"].(string); pType == "text" {
+										if t, ok := pMap["text"].(string); ok {
+											text += t
+										}
+									}
+								}
 							}
-							return "chat_prefix:" + content
+						}
+						if text != "" {
+							totalLen += len(text)
+							if prefixBuf.Len() > 0 {
+								prefixBuf.WriteString(" | ")
+							}
+							prefixBuf.WriteString(role + ":" + text)
+						}
+						if role == "user" {
+							break
+						}
+					}
+
+					fullPrefix := prefixBuf.String()
+					if fullPrefix != "" {
+						preview := fullPrefix
+						if len(preview) > 60 {
+							preview = preview[:60] + "..."
+						}
+						prefixKey := fullPrefix
+						if len(prefixKey) > 256 {
+							prefixKey = prefixKey[:256]
+						}
+						rawKey := "chat_prefix:" + prefixKey
+						return CacheAwareKeyInfo{
+							Source:     "chat_prefix",
+							RawKey:     rawKey,
+							KeyPreview: preview,
+							KeyLength:  totalLen,
+							Hash:       hashKey(rawKey),
 						}
 					}
 				}
 			}
 		}
 	}
-	return extractSessionKey(r)
+
+	// 3. Fallback to session headers
+	if val := r.Header.Get("X-Session-ID"); val != "" {
+		return CacheAwareKeyInfo{Source: "header:X-Session-ID", RawKey: val, KeyPreview: val, KeyLength: len(val), Hash: hashKey(val)}
+	}
+	if val := r.Header.Get("X-User-ID"); val != "" {
+		return CacheAwareKeyInfo{Source: "header:X-User-ID", RawKey: val, KeyPreview: val, KeyLength: len(val), Hash: hashKey(val)}
+	}
+	if val := r.Header.Get("X-Tenant-ID"); val != "" {
+		return CacheAwareKeyInfo{Source: "header:X-Tenant-ID", RawKey: val, KeyPreview: val, KeyLength: len(val), Hash: hashKey(val)}
+	}
+	if val := r.Header.Get("X-Request-ID"); val != "" {
+		return CacheAwareKeyInfo{Source: "header:X-Request-ID", RawKey: val, KeyPreview: val, KeyLength: len(val), Hash: hashKey(val)}
+	}
+
+	// 4. Remote Address fallback
+	remote := r.RemoteAddr
+	return CacheAwareKeyInfo{Source: "remote_addr", RawKey: remote, KeyPreview: remote, KeyLength: len(remote), Hash: hashKey(remote)}
+}
+
+func extractCacheAwareKey(r *http.Request) string {
+	return extractCacheAwareKeyInfo(r).RawKey
 }
 
 // NewBalancer creates a Balancer based on Policy.

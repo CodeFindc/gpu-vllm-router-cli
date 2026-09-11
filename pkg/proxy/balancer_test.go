@@ -3,6 +3,7 @@ package proxy
 import (
 	"net/http"
 	"net/url"
+	"strings"
 	"sync/atomic"
 	"testing"
 
@@ -111,5 +112,63 @@ func TestFactoryNewBalancer(t *testing.T) {
 	}
 	if b := NewBalancer(router.PolicyPowerOfTwo, targets); b == nil {
 		t.Error("expected balancer")
+	}
+	if b := NewBalancer(router.PolicyCacheAware, targets); b == nil {
+		t.Error("expected balancer")
+	}
+}
+
+func TestCacheAwareBalancer(t *testing.T) {
+	targets := makeTargets("http://worker-cache-1:8000", "http://worker-cache-2:8000", "http://worker-cache-3:8000")
+	b := NewCacheAwareBalancer(targets, 100)
+
+	// 1. Test chat completions prefix matching consistency
+	bodyChatA1 := `{"model": "qwen", "messages": [{"role": "system", "content": "You are a code analyzer"}, {"role": "user", "content": "Fix bug in line 10"}]}`
+	reqA1, _ := http.NewRequest(http.MethodPost, "http://localhost/v1/chat/completions", strings.NewReader(bodyChatA1))
+
+	targetA1, err := b.SelectTarget(reqA1)
+	if err != nil {
+		t.Fatalf("CacheAware SelectTarget failed: %v", err)
+	}
+
+	// Repeated requests with the exact same prefix should route to the same worker!
+	for i := 0; i < 10; i++ {
+		bodyChatA2 := `{"model": "qwen", "messages": [{"role": "system", "content": "You are a code analyzer"}, {"role": "user", "content": "Different user follow up question"}]}`
+		reqA2, _ := http.NewRequest(http.MethodPost, "http://localhost/v1/chat/completions", strings.NewReader(bodyChatA2))
+		targetA2, err := b.SelectTarget(reqA2)
+		if err != nil {
+			t.Fatalf("CacheAware SelectTarget iteration %d failed: %v", i, err)
+		}
+		if targetA1.URLString != targetA2.URLString {
+			t.Fatalf("CacheAware routing failed! Shared system prefix should hit same worker %s, got %s", targetA1.URLString, targetA2.URLString)
+		}
+	}
+
+	// 2. Test completions prompt matching
+	bodyPrompt := `{"model": "deepseek", "prompt": "Once upon a time in a faraway galaxy"}`
+	reqPrompt, _ := http.NewRequest(http.MethodPost, "http://localhost/v1/completions", strings.NewReader(bodyPrompt))
+	targetP1, err := b.SelectTarget(reqPrompt)
+	if err != nil {
+		t.Fatalf("Prompt routing failed: %v", err)
+	}
+	reqPrompt2, _ := http.NewRequest(http.MethodPost, "http://localhost/v1/completions", strings.NewReader(bodyPrompt))
+	targetP2, err := b.SelectTarget(reqPrompt2)
+	if err != nil {
+		t.Fatalf("Prompt routing 2 failed: %v", err)
+	}
+	if targetP1.URLString != targetP2.URLString {
+		t.Fatalf("Prompt routing consistency broken: %s vs %s", targetP1.URLString, targetP2.URLString)
+	}
+
+	// 3. Test fallback to Session ID when no body
+	reqHeader, _ := http.NewRequest(http.MethodGet, "http://localhost/v1/models", nil)
+	reqHeader.Header.Set("X-Session-ID", "custom-session-12345")
+	targetH1, err := b.SelectTarget(reqHeader)
+	if err != nil {
+		t.Fatalf("Header fallback routing failed: %v", err)
+	}
+	targetH2, _ := b.SelectTarget(reqHeader)
+	if targetH1.URLString != targetH2.URLString {
+		t.Fatalf("Header fallback consistency broken: %s vs %s", targetH1.URLString, targetH2.URLString)
 	}
 }

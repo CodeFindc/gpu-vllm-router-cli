@@ -185,8 +185,13 @@ func (s *Supervisor) syncWorkers(activeURLs []string) {
 		}
 	}
 
-	for u := range s.workerStates {
+	for u, wb := range s.workerStates {
 		if !activeSet[u] {
+			// Do not prune immediately if worker is currently unhealthy/tripped;
+			// retain it so the probe loop and auto-healer can inspect and heal it!
+			if wb != nil && !wb.Healthy {
+				continue
+			}
 			log.Printf("[Supervisor] Pruning obsolete worker state: %s", u)
 			delete(s.workerStates, u)
 		}
@@ -195,6 +200,10 @@ func (s *Supervisor) syncWorkers(activeURLs []string) {
 	s.endpointsMu.Lock()
 	for u := range s.endpointsMeta {
 		if !activeSet[u] {
+			// Retain metadata for unhealthy workers so their InstanceID is preserved for auto-healing
+			if wb := s.workerStates[u]; wb != nil && !wb.Healthy {
+				continue
+			}
 			delete(s.endpointsMeta, u)
 		}
 	}
@@ -733,6 +742,17 @@ func (s *Supervisor) handleProxy(w http.ResponseWriter, req *http.Request) {
 			idx = -idx
 		}
 		chosenURL := healthyURLs[idx]
+
+		s.endpointsMu.RLock()
+		epMeta, hasMeta := s.endpointsMeta[chosenURL]
+		s.endpointsMu.RUnlock()
+		instDesc := ""
+		if hasMeta && epMeta.WorkerName != "" {
+			instDesc = fmt.Sprintf(" (Worker: %s, Instance: %s)", epMeta.WorkerName, epMeta.InstanceName)
+		}
+		log.Printf("[Supervisor:Route] 🚀 [Model: %s] [DirectProxy] %s %s -> %s%s (ActiveConns: %d)",
+			runner.ModelName, req.Method, req.URL.Path, chosenURL, instDesc, atomic.LoadInt64(&runner.activeConns))
+
 		destURL, parseErr := url.Parse(chosenURL)
 		if parseErr != nil {
 			atomic.AddInt64(&runner.activeConns, -1)
@@ -785,6 +805,8 @@ func (s *Supervisor) handleProxy(w http.ResponseWriter, req *http.Request) {
 
 	proxy := &httputil.ReverseProxy{
 		Director: func(r *http.Request) {
+			log.Printf("[Supervisor:Route] 🔀 [Model: %s] [Mode: run] %s %s -> vllm-router (%s) (ActiveConns: %d)",
+				runner.ModelName, r.Method, r.URL.Path, target.String(), atomic.LoadInt64(&runner.activeConns))
 			r.URL.Scheme = target.Scheme
 			r.URL.Host = target.Host
 			r.Host = target.Host
@@ -843,6 +865,10 @@ func (s *Supervisor) spawnProcessForModel(ctx context.Context, modelName string,
 		}
 	}
 
+	if cfg.Policy == PolicyCacheAware && cfg.LogLevel == "" {
+		cfg.LogLevel = "debug"
+	}
+
 	args := BuildArgs(cfg)
 	bin := cfg.RouterBin
 	if bin == "" {
@@ -853,7 +879,7 @@ func (s *Supervisor) spawnProcessForModel(ctx context.Context, modelName string,
 		bin, host, port, modelName, len(workerURLs), cfg.Policy, cfg.BalanceAbsThreshold, cfg.BalanceRelThreshold, cfg.CacheThreshold, cfg.ExtraArgs)
 
 	cmd := exec.CommandContext(ctx, bin, args...)
-	cmd.Env = os.Environ()
+	cmd.Env = append(os.Environ(), "RUST_LOG=vllm_router=debug,info")
 
 	stdout, err := cmd.StdoutPipe()
 	if err != nil {
@@ -1011,6 +1037,14 @@ func (s *Supervisor) probeRunnerWorkers(ctx context.Context, runner *ModelRunner
 			wb.Healthy = true
 			wb.LastErr = ""
 			wb.OpenSince = time.Time{}
+			if s.autoHealer != nil {
+				s.endpointsMu.RLock()
+				ep, ok := s.endpointsMeta[res.url]
+				s.endpointsMu.RUnlock()
+				if ok && ep.InstanceID > 0 {
+					s.autoHealer.ResetAttempts(ep.InstanceID)
+				}
+			}
 		} else {
 			wb.ConsecutiveFails++
 			wb.LastErr = fmt.Sprintf("%v", res.err)
@@ -1027,24 +1061,26 @@ func (s *Supervisor) probeRunnerWorkers(ctx context.Context, runner *ModelRunner
 		}
 	}
 
-	type restartItem struct {
-		url     string
-		reason  string
-		lastErr string
+	type candItem struct {
+		ep        gpustack.WorkerEndpoint
+		openSince time.Time
+		lastErr   string
 	}
-	var restartCandidates []restartItem
+	var candidates []candItem
 	if s.autoHealer != nil {
+		s.endpointsMu.RLock()
 		for _, u := range allURLs {
 			if wb := s.workerStates[u]; wb != nil && !wb.Healthy {
-				if shouldRestart, reason := s.autoHealer.ShouldRestart(wb.OpenSince, wb.LastErr); shouldRestart {
-					restartCandidates = append(restartCandidates, restartItem{
-						url:     u,
-						reason:  reason,
-						lastErr: wb.LastErr,
+				if ep, ok := s.endpointsMeta[u]; ok && ep.InstanceID > 0 {
+					candidates = append(candidates, candItem{
+						ep:        ep,
+						openSince: wb.OpenSince,
+						lastErr:   wb.LastErr,
 					})
 				}
 			}
 		}
+		s.endpointsMu.RUnlock()
 	}
 
 	var healthyURLs []string
@@ -1055,20 +1091,15 @@ func (s *Supervisor) probeRunnerWorkers(ctx context.Context, runner *ModelRunner
 	}
 	s.workerMu.Unlock()
 
-	for _, cand := range restartCandidates {
-		s.endpointsMu.RLock()
-		ep, hasMeta := s.endpointsMeta[cand.url]
-		s.endpointsMu.RUnlock()
-		if hasMeta && ep.InstanceID > 0 {
-			go func(targetEp gpustack.WorkerEndpoint, trigReason string, lastE string) {
-				crashPath, rErr := s.autoHealer.TriggerIncidentRestart(context.Background(), targetEp, trigReason, lastE)
-				if rErr != nil {
-					log.Printf("[Supervisor:AutoHeal] ❌ Auto-heal failed for %s (ID: %d): %v", targetEp.InstanceName, targetEp.InstanceID, rErr)
-				} else if crashPath != "" {
-					log.Printf("[Supervisor:AutoHeal] 🚀 Auto-heal initiated for %s (ID: %d). Crash report saved to %s", targetEp.InstanceName, targetEp.InstanceID, crashPath)
-				}
-			}(ep, cand.reason, cand.lastErr)
-		}
+	for _, cand := range candidates {
+		go func(c candItem) {
+			crashPath, rErr := s.autoHealer.EvaluateAndTrigger(context.Background(), c.ep, c.openSince, c.lastErr)
+			if rErr != nil {
+				log.Printf("[Supervisor:AutoHeal] ❌ Auto-heal failed for %s (ID: %d): %v", c.ep.InstanceName, c.ep.InstanceID, rErr)
+			} else if crashPath != "" {
+				log.Printf("[Supervisor:AutoHeal] 🚀 Auto-heal initiated for %s (ID: %d). Crash report saved to %s", c.ep.InstanceName, c.ep.InstanceID, crashPath)
+			}
+		}(cand)
 	}
 
 	sort.Strings(healthyURLs)
@@ -1124,11 +1155,16 @@ func (s *Supervisor) fastProbeRunner(runner *ModelRunner) {
 	s.probeRunnerWorkers(ctx, runner)
 }
 
-func streamPipe(r io.Reader, prefix string) {
+// StreamPipe reads from an io.Reader and logs each line with a prefix.
+func StreamPipe(r io.Reader, prefix string) {
 	scanner := bufio.NewScanner(r)
 	for scanner.Scan() {
 		log.Printf("%s %s", prefix, scanner.Text())
 	}
+}
+
+func streamPipe(r io.Reader, prefix string) {
+	StreamPipe(r, prefix)
 }
 
 func (s *Supervisor) checkHealth(ctx context.Context, port int, timeout time.Duration) error {

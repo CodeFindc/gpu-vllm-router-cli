@@ -404,21 +404,49 @@ func (c *Client) GetInstanceLogs(ctx context.Context, instanceID int, tailLines 
 	return string(body), nil
 }
 
-// RestartInstance requests GPUStack to restart a specific model instance.
-func (c *Client) RestartInstance(ctx context.Context, instanceID int) error {
-	path := fmt.Sprintf("/v2/model-instances/%d/restart", instanceID)
-	resp, err := c.doRequest(ctx, http.MethodPost, path, nil)
+// GetInstance fetches the latest details and state of a model instance from GPUStack.
+func (c *Client) GetInstance(ctx context.Context, instanceID int) (*ModelInstancePublic, error) {
+	path := fmt.Sprintf("/v2/model-instances/%d", instanceID)
+	resp, err := c.doRequest(ctx, http.MethodGet, path, nil)
 	if err != nil {
-		return fmt.Errorf("failed to send restart request for instance %d: %w", instanceID, err)
+		return nil, fmt.Errorf("failed to get instance %d: %w", instanceID, err)
+	}
+	defer resp.Body.Close()
+
+	if resp.StatusCode != http.StatusOK {
+		body, _ := io.ReadAll(resp.Body)
+		return nil, fmt.Errorf("get instance %d failed with HTTP %d: %s", instanceID, resp.StatusCode, string(body))
+	}
+
+	var inst ModelInstancePublic
+	if err := json.NewDecoder(resp.Body).Decode(&inst); err != nil {
+		return nil, fmt.Errorf("failed to decode instance %d: %w", instanceID, err)
+	}
+	return &inst, nil
+}
+
+// DeleteInstance deletes a model instance in GPUStack.
+// In GPUStack's controller architecture, deleting an instance causes the scheduler
+// to immediately provision and boot a fresh replacement instance to satisfy desired replicas.
+func (c *Client) DeleteInstance(ctx context.Context, instanceID int) error {
+	path := fmt.Sprintf("/v2/model-instances/%d", instanceID)
+	resp, err := c.doRequest(ctx, http.MethodDelete, path, nil)
+	if err != nil {
+		return fmt.Errorf("failed to delete instance %d: %w", instanceID, err)
 	}
 	defer resp.Body.Close()
 
 	if resp.StatusCode < 200 || resp.StatusCode >= 300 {
 		body, _ := io.ReadAll(resp.Body)
-		return fmt.Errorf("restart instance %d failed with HTTP %d: %s", instanceID, resp.StatusCode, string(body))
+		return fmt.Errorf("delete instance %d failed with HTTP %d: %s", instanceID, resp.StatusCode, string(body))
 	}
-
 	return nil
+}
+
+// RestartInstance restarts an instance by deleting it via GPUStack API,
+// prompting the GPUStack controller to spawn a clean replacement instance.
+func (c *Client) RestartInstance(ctx context.Context, instanceID int) error {
+	return c.DeleteInstance(ctx, instanceID)
 }
 
 

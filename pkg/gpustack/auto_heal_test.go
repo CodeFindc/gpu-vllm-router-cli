@@ -2,10 +2,10 @@ package gpustack
 
 import (
 	"context"
+	"encoding/json"
 	"net/http"
 	"net/http/httptest"
 	"os"
-	"path/filepath"
 	"strings"
 	"testing"
 	"time"
@@ -84,10 +84,10 @@ func TestAutoHealer_TriggerIncidentRestart(t *testing.T) {
 			logRequested = true
 			w.WriteHeader(http.StatusOK)
 			w.Write([]byte("2026-09-11 12:00:00 [ERROR] vllm.engine.async_llm_engine: Engine is dead!\n2026-09-11 12:00:01 [FATAL] CUDA out of memory.\n"))
-		case r.URL.Path == "/v2/model-instances/101/restart" && r.Method == http.MethodPost:
+		case r.URL.Path == "/v2/model-instances/101" && r.Method == http.MethodDelete:
 			restartRequested = true
 			w.WriteHeader(http.StatusOK)
-			w.Write([]byte(`{"status":"restarting"}`))
+			w.Write([]byte(`{"status":"deleted"}`))
 		default:
 			w.WriteHeader(http.StatusNotFound)
 		}
@@ -130,7 +130,7 @@ func TestAutoHealer_TriggerIncidentRestart(t *testing.T) {
 		t.Errorf("Expected logs to be requested from GPUStack API")
 	}
 	if !restartRequested {
-		t.Errorf("Expected restart API to be called")
+		t.Errorf("Expected restart API (DELETE /v2/model-instances/101) to be called")
 	}
 	if crashPath == "" {
 		t.Fatalf("Expected crashPath to be returned")
@@ -185,9 +185,104 @@ func TestAutoHealer_TriggerIncidentRestart(t *testing.T) {
 		t.Errorf("Expected third restart to be refused because MaxRestartAttempts was reached")
 	}
 
-	// Ensure crash folder structure is sanitized
-	modelDir := filepath.Join(tmpDir, "deepseek-v3")
-	if _, err := os.Stat(modelDir); os.IsNotExist(err) {
-		t.Errorf("Expected directory %s to exist", modelDir)
+	// 5. Test ResetAttempts: should allow new restart
+	healer.ResetAttempts(101)
+	rec, ok := healer.GetRecord(101)
+	if !ok || rec.Attempts != 0 {
+		t.Errorf("Expected attempts to reset to 0, got %d", rec.Attempts)
+	}
+}
+
+func TestAutoHealer_BootingGuardAndStateMessage(t *testing.T) {
+	tmpDir, err := os.MkdirTemp("", "crash_logs_booting_*")
+	if err != nil {
+		t.Fatalf("Failed to create temp dir: %v", err)
+	}
+	defer os.RemoveAll(tmpDir)
+
+	var currentInstanceState string
+	var currentStateMessage string
+	var restartDeleted bool
+
+	ts := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch {
+		case r.URL.Path == "/v2/model-instances/202" && r.Method == http.MethodGet:
+			w.WriteHeader(http.StatusOK)
+			_ = json.NewEncoder(w).Encode(ModelInstancePublic{
+				ID:           202,
+				Name:         "deepseek-booting-1",
+				ModelName:    "deepseek-v3",
+				State:        currentInstanceState,
+				StateMessage: currentStateMessage,
+			})
+		case strings.HasPrefix(r.URL.Path, "/v2/model-instances/202/logs"):
+			w.WriteHeader(http.StatusOK)
+			w.Write([]byte("container logs sample"))
+		case r.URL.Path == "/v2/model-instances/202" && r.Method == http.MethodDelete:
+			restartDeleted = true
+			w.WriteHeader(http.StatusOK)
+			w.Write([]byte(`{"status":"deleted"}`))
+		default:
+			w.WriteHeader(http.StatusNotFound)
+		}
+	}))
+	defer ts.Close()
+
+	client, err := NewClient(Config{
+		BaseURL: ts.URL,
+		APIKey:  "test-key",
+	})
+	if err != nil {
+		t.Fatalf("Failed to create client: %v", err)
+	}
+
+	cfg := config.AutoHealConfig{
+		Enabled:            true,
+		UnhealthyTimeout:   1 * time.Minute,
+		CrashLogDir:        tmpDir,
+		MaxRestartAttempts: 3,
+		RestartCooldown:    100 * time.Millisecond,
+		FatalKeywords:      []string{"out of memory", "nccl"},
+	}
+	healer := NewAutoHealer(client, cfg)
+
+	ep := WorkerEndpoint{
+		ModelName:    "deepseek-v3",
+		InstanceName: "deepseek-booting-1",
+		InstanceID:   202,
+		URL:          "http://192.168.1.50:8002",
+	}
+
+	// Case 1: Booting Guard - instance is currently "downloading"
+	currentInstanceState = "downloading"
+	ctx := context.Background()
+	path, err := healer.EvaluateAndTrigger(ctx, ep, time.Now().Add(-5*time.Minute), "connection refused")
+	if err != nil {
+		t.Fatalf("EvaluateAndTrigger returned error: %v", err)
+	}
+	if path != "" || restartDeleted {
+		t.Errorf("Booting Guard failed: instance in downloading state should NOT be restarted")
+	}
+
+	// Case 2: Booting Guard - instance is "starting"
+	currentInstanceState = "starting"
+	path, _ = healer.EvaluateAndTrigger(ctx, ep, time.Now().Add(-5*time.Minute), "connection refused")
+	if path != "" || restartDeleted {
+		t.Errorf("Booting Guard failed: instance in starting state should NOT be restarted")
+	}
+
+	// Case 3: Authoritative StateMessage check - probe only sees "connection refused",
+	// but GPUStack reports State="error" and StateMessage="RuntimeError: CUDA out of memory"
+	currentInstanceState = "error"
+	currentStateMessage = "RuntimeError: CUDA out of memory. Tried to allocate 4.00 GiB"
+	path, err = healer.EvaluateAndTrigger(ctx, ep, time.Now().Add(-5*time.Second), "connectex: connection refused")
+	if err != nil {
+		t.Fatalf("Unexpected error: %v", err)
+	}
+	if !restartDeleted {
+		t.Errorf("Expected restart to be triggered for GPUStack StateMessage with CUDA OOM")
+	}
+	if path == "" {
+		t.Errorf("Expected crash report path to be generated")
 	}
 }
