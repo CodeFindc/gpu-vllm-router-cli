@@ -26,6 +26,7 @@ import (
 	"gpu-vllm-router/pkg/config"
 	"gpu-vllm-router/pkg/dashboard"
 	"gpu-vllm-router/pkg/gpustack"
+	"gpu-vllm-router/pkg/logger"
 	"gpu-vllm-router/pkg/swagger"
 )
 
@@ -1220,11 +1221,11 @@ func (s *Supervisor) fastProbeRunner(runner *ModelRunner) {
 	s.probeRunnerWorkers(ctx, runner)
 }
 
-// StreamPipe reads from an io.Reader and logs each line with a prefix.
+// StreamPipe reads from an io.Reader and logs each line with a prefix and level detection.
 func StreamPipe(r io.Reader, prefix string) {
 	scanner := bufio.NewScanner(r)
 	for scanner.Scan() {
-		log.Printf("%s %s", prefix, scanner.Text())
+		logger.LogLine(fmt.Sprintf("%s %s", prefix, scanner.Text()))
 	}
 }
 

@@ -55,6 +55,9 @@ router:
   # 路由器日志输出级别 (对应官方 --log-level: debug, info, warn, error)
   log_level: "info"
 
+  # 主调度网关自身独立日志级别 (可选，留空则自动继承上面的 log_level: debug, info, warn, error)
+  # app_log_level: "info"
+
   # 官方 vllm-router 原生滚动日志保存目录 (可选，对应官方 --log-dir)
   # 容器化部署时挂载为 /app/logs/vllm-router，将自动持久化到宿主机 ./logs/vllm-router
   log_dir: "/app/logs/vllm-router"

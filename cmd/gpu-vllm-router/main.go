@@ -15,6 +15,7 @@ import (
 
 	"gpu-vllm-router/pkg/config"
 	"gpu-vllm-router/pkg/gpustack"
+	"gpu-vllm-router/pkg/logger"
 	"gpu-vllm-router/pkg/proxy"
 	"gpu-vllm-router/pkg/router"
 )
@@ -32,46 +33,57 @@ func printHelpBanner() {
 	fmt.Println(`===================================================================`)
 }
 
-func setupLogging(configuredPath string, mode string) func() {
+func setupLogging(configuredPath string, mode string, logLevel string) func() {
 	if mode == "cmd" {
 		return func() {}
 	}
-	if strings.EqualFold(configuredPath, "off") || strings.EqualFold(configuredPath, "none") {
-		return func() {}
+
+	if logLevel != "" {
+		logger.SetLevelString(logLevel)
 	}
 
 	targetFile := configuredPath
-	if targetFile == "" {
+	if strings.EqualFold(configuredPath, "off") || strings.EqualFold(configuredPath, "none") {
+		targetFile = ""
+	} else if targetFile == "" {
 		if fi, err := os.Stat("/app/logs"); err == nil && fi.IsDir() {
 			targetFile = "/app/logs/router.log"
 		} else if fi, err := os.Stat("logs"); err == nil && fi.IsDir() {
 			targetFile = "logs/router.log"
 		}
 	}
-	if targetFile == "" {
-		return func() {}
+
+	var out io.Writer = os.Stderr
+	var cleanup = func() {}
+
+	if targetFile != "" {
+		dir := filepath.Dir(targetFile)
+		if err := os.MkdirAll(dir, 0755); err != nil {
+			log.Printf("警告: 创建物理日志目录 %q 失败: %v", dir, err)
+		} else {
+			f, err := os.OpenFile(targetFile, os.O_CREATE|os.O_WRONLY|os.O_APPEND, 0644)
+			if err != nil {
+				log.Printf("警告: 打开物理日志文件 %q 失败: %v", targetFile, err)
+			} else {
+				out = io.MultiWriter(os.Stderr, f)
+				cleanup = func() {
+					_ = f.Sync()
+					_ = f.Close()
+				}
+			}
+		}
 	}
 
-	dir := filepath.Dir(targetFile)
-	if err := os.MkdirAll(dir, 0755); err != nil {
-		log.Printf("警告: 创建物理日志目录 %q 失败: %v", dir, err)
-		return func() {}
+	logger.SetOutput(out)
+	logger.BridgeStandardLog()
+
+	if targetFile != "" {
+		logger.Infof("日志系统初始化完成 (主日志级别: %s) -> 双写落盘: %s", logger.GetLevel().String(), targetFile)
+	} else {
+		logger.Infof("日志系统初始化完成 (主日志级别: %s)", logger.GetLevel().String())
 	}
 
-	f, err := os.OpenFile(targetFile, os.O_CREATE|os.O_WRONLY|os.O_APPEND, 0644)
-	if err != nil {
-		log.Printf("警告: 打开物理日志文件 %q 失败: %v", targetFile, err)
-		return func() {}
-	}
-
-	mw := io.MultiWriter(os.Stderr, f)
-	log.SetOutput(mw)
-	log.Printf("物理运行日志双写落盘已启用 -> %s", targetFile)
-
-	return func() {
-		_ = f.Sync()
-		_ = f.Close()
-	}
+	return cleanup
 }
 
 func main() {
@@ -114,7 +126,8 @@ func main() {
 
 	// Engine & Logging
 	backendFlag := flag.String("backend", "vllm", "后端推理引擎类型 (vllm, sglang, trtllm, openai, anthropic)")
-	logLevelFlag := flag.String("log-level", "info", "路由器日志级别 (debug, info, warn, error)")
+	logLevelFlag := flag.String("log-level", "info", "全局与官方 vllm-router 日志级别 (debug, info, warn, error)")
+	appLogLevelFlag := flag.String("app-log-level", "", "主调度器自身独立日志级别 (默认继承 log-level: debug, info, warn, error)")
 	logDirFlag := flag.String("log-dir", "", "路由器日志存储目录")
 	logFileFlag := flag.String("log-file", "", "调度器主控与各子进程汇总运行物理日志文件路径 (如 logs/router.log, off 可禁用)")
 
@@ -212,6 +225,9 @@ func main() {
 		if !explicitFlags["log-level"] && fileCfg.Router.LogLevel != "" {
 			*logLevelFlag = fileCfg.Router.LogLevel
 		}
+		if !explicitFlags["app-log-level"] && fileCfg.Router.AppLogLevel != "" {
+			*appLogLevelFlag = fileCfg.Router.AppLogLevel
+		}
 		if !explicitFlags["log-dir"] && fileCfg.Router.LogDir != "" {
 			*logDirFlag = fileCfg.Router.LogDir
 		}
@@ -247,7 +263,11 @@ func main() {
 		}
 	}
 
-	cleanupLogger := setupLogging(*logFileFlag, *mode)
+	effectiveAppLogLevel := *logLevelFlag
+	if *appLogLevelFlag != "" {
+		effectiveAppLogLevel = *appLogLevelFlag
+	}
+	cleanupLogger := setupLogging(*logFileFlag, *mode, effectiveAppLogLevel)
 	defer cleanupLogger()
 
 	// 1. If user requested --list-policies

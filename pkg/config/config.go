@@ -31,6 +31,7 @@ type RouterConfig struct {
 	RouterBin                  string        `yaml:"router_bin"`
 	Backend                    string        `yaml:"backend,omitempty"`
 	LogLevel                   string        `yaml:"log_level,omitempty"`
+	AppLogLevel                string        `yaml:"app_log_level,omitempty"`
 	LogDir                     string        `yaml:"log_dir,omitempty"`
 	LogFile                    string        `yaml:"log_file,omitempty"`
 	WatchInterval              time.Duration `yaml:"watch_interval"`

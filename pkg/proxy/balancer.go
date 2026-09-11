@@ -16,6 +16,7 @@ import (
 	"sync"
 	"sync/atomic"
 
+	"gpu-vllm-router/pkg/logger"
 	"gpu-vllm-router/pkg/router"
 )
 
@@ -413,7 +414,7 @@ func (b *CacheAwareBalancer) SelectTargetExcluding(r *http.Request, excluded map
 			continue
 		}
 		if target.CircuitBreaker == nil || target.CircuitBreaker.CanExecute() {
-			log.Printf("[Balancer:CacheAware] 🎯 Routed to %s (Active: %d) | Key: [%s] hash=0x%08x len=%d sample=%q",
+			logger.Debugf("[Balancer:CacheAware] 🎯 Routed to %s (Active: %d) | Key: [%s] hash=0x%08x len=%d sample=%q",
 				target.URLString, atomic.LoadInt64(&target.ActiveConns), info.Source, info.Hash, info.KeyLength, info.KeyPreview)
 			return target, nil
 		}

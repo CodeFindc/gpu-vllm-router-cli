@@ -192,6 +192,7 @@ router:
   mode: "run"
   backend: "sglang"
   log_level: "debug"
+  app_log_level: "warn"
   log_dir: "/var/log/router"
   eviction_interval: 240
   max_tree_size: 1048576
@@ -233,6 +234,9 @@ circuit_breaker:
 	}
 	if cfg.Router.LogLevel != "debug" {
 		t.Errorf("expected log_level debug, got %s", cfg.Router.LogLevel)
+	}
+	if cfg.Router.AppLogLevel != "warn" {
+		t.Errorf("expected app_log_level warn, got %s", cfg.Router.AppLogLevel)
 	}
 	if cfg.Router.LogDir != "/var/log/router" {
 		t.Errorf("expected log_dir /var/log/router, got %s", cfg.Router.LogDir)
