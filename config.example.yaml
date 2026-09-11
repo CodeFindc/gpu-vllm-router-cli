@@ -201,3 +201,37 @@ circuit_breaker:
 #       - "--worker-startup-timeout-secs"
 #       - "300"
 
+# ------------------------------------------------------------------------------
+# 11. 致命故障日志保存与实例自动化重启自愈 (Auto Heal)
+# ------------------------------------------------------------------------------
+# 当节点发生 CUDA OOM、NCCL 卡死、内核 Panic 或持续不可恢复熔断时：
+# 1. 自动调用 GPUStack 容器日志接口拉取最后 1000 行容器与推理日志
+# 2. 写入本地带时间戳与故障元数据的崩溃审计报告 (logs/crashes/<model>/<instance>_<timestamp>.log)
+# 3. 自动调用 GPUStack API 重启该模型实例
+# 4. 实例重启后自动获取新动态端口，并通过零停机机制平滑重新加入集群
+auto_heal:
+  # 是否开启实例致命故障自动重启与日志归档自愈 (默认: false，防止本地/离线环境误重启)
+  enabled: false
+
+  # 连续处于熔断 OPEN 状态超过该阈值时判定为不可恢复死锁，触发日志保存与重启
+  unhealthy_timeout: 3m
+
+  # 判定为致命故障的关键词列表 (若探测报错包含关键词立即触发重启，不等待超时)
+  fatal_keywords:
+    - "out of memory"
+    - "cuda error: out of memory"
+    - "nccl"
+    - "cuda error"
+    - "engine is dead"
+    - "vllm engine crashed"
+    - "segmentation fault"
+
+  # 崩溃日志与事件审计报告本地持久化存储根目录
+  crash_log_dir: "logs/crashes"
+
+  # 单实例最大自动重启尝试次数 (防止代码/权重固有 bug 导致的无限重启雪崩)
+  max_restart_attempts: 3
+
+  # 单实例重启防抖冷却期 (在此时间内不重复触发重启)
+  restart_cooldown: 5m
+

@@ -380,3 +380,45 @@ func (c *Client) GetAllRunningWorkerEndpoints(ctx context.Context) (*ClusterEndp
 	return result, nil
 }
 
+// GetInstanceLogs retrieves recent container logs (stdout/stderr) for a specific model instance.
+func (c *Client) GetInstanceLogs(ctx context.Context, instanceID int, tailLines int) (string, error) {
+	if tailLines <= 0 {
+		tailLines = 1000
+	}
+	path := fmt.Sprintf("/v2/model-instances/%d/logs?tail=%d", instanceID, tailLines)
+	resp, err := c.doRequest(ctx, http.MethodGet, path, nil)
+	if err != nil {
+		return "", fmt.Errorf("failed to fetch logs for instance %d: %w", instanceID, err)
+	}
+	defer resp.Body.Close()
+
+	body, err := io.ReadAll(resp.Body)
+	if err != nil {
+		return "", fmt.Errorf("failed to read logs response for instance %d: %w", instanceID, err)
+	}
+
+	if resp.StatusCode != http.StatusOK {
+		return "", fmt.Errorf("fetch instance %d logs failed with HTTP %d: %s", instanceID, resp.StatusCode, string(body))
+	}
+
+	return string(body), nil
+}
+
+// RestartInstance requests GPUStack to restart a specific model instance.
+func (c *Client) RestartInstance(ctx context.Context, instanceID int) error {
+	path := fmt.Sprintf("/v2/model-instances/%d/restart", instanceID)
+	resp, err := c.doRequest(ctx, http.MethodPost, path, nil)
+	if err != nil {
+		return fmt.Errorf("failed to send restart request for instance %d: %w", instanceID, err)
+	}
+	defer resp.Body.Close()
+
+	if resp.StatusCode < 200 || resp.StatusCode >= 300 {
+		body, _ := io.ReadAll(resp.Body)
+		return fmt.Errorf("restart instance %d failed with HTTP %d: %s", instanceID, resp.StatusCode, string(body))
+	}
+
+	return nil
+}
+
+

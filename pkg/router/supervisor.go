@@ -52,6 +52,7 @@ type SupervisorConfig struct {
 	RouterCfg      Config
 	ConfigFilePath string
 	ModelRules     []config.ModelRule
+	AutoHeal       config.AutoHealConfig
 }
 
 type runningProcess struct {
@@ -94,6 +95,10 @@ type Supervisor struct {
 
 	workerMu     sync.RWMutex
 	workerStates map[string]*WorkerBreaker
+
+	endpointsMu   sync.RWMutex
+	endpointsMeta map[string]gpustack.WorkerEndpoint
+	autoHealer    *gpustack.AutoHealer
 
 	frontServer *http.Server
 	stopCh      chan struct{}
@@ -138,6 +143,8 @@ func NewSupervisor(client *gpustack.Client, modelName string, cfg SupervisorConf
 		cfg:            cfg,
 		runners:        make(map[string]*ModelRunner),
 		workerStates:   make(map[string]*WorkerBreaker),
+		endpointsMeta:  make(map[string]gpustack.WorkerEndpoint),
+		autoHealer:     gpustack.NewAutoHealer(client, cfg.AutoHeal),
 		stopCh:         make(chan struct{}),
 		configFilePath: cfg.ConfigFilePath,
 		modelRules:     rulesMap,
@@ -183,6 +190,22 @@ func (s *Supervisor) syncWorkers(activeURLs []string) {
 			log.Printf("[Supervisor] Pruning obsolete worker state: %s", u)
 			delete(s.workerStates, u)
 		}
+	}
+
+	s.endpointsMu.Lock()
+	for u := range s.endpointsMeta {
+		if !activeSet[u] {
+			delete(s.endpointsMeta, u)
+		}
+	}
+	s.endpointsMu.Unlock()
+}
+
+func (s *Supervisor) recordEndpointsMeta(endpoints []gpustack.WorkerEndpoint) {
+	s.endpointsMu.Lock()
+	defer s.endpointsMu.Unlock()
+	for _, ep := range endpoints {
+		s.endpointsMeta[ep.URL] = ep
 	}
 }
 
@@ -292,6 +315,7 @@ func (s *Supervisor) Start(ctx context.Context) error {
 			} else if len(endpoints) == 0 {
 				log.Printf("[Supervisor] ⚠️ Warning: no running instances found for model %q in GPUStack at startup. Entering STANDBY mode...", s.modelName)
 			} else {
+				s.recordEndpointsMeta(endpoints)
 				var urls []string
 				log.Printf("[Supervisor] Discovered %d running instance(s) for model %s (ID: %d):", len(endpoints), model.Name, model.ID)
 				for _, ep := range endpoints {
@@ -327,6 +351,7 @@ func (s *Supervisor) Start(ctx context.Context) error {
 
 				var allClusterURLs []string
 				for mName, eps := range cluster.ModelsEndpoints {
+					s.recordEndpointsMeta(eps)
 					var urls []string
 					for _, ep := range eps {
 						urls = append(urls, ep.URL)
@@ -1002,6 +1027,26 @@ func (s *Supervisor) probeRunnerWorkers(ctx context.Context, runner *ModelRunner
 		}
 	}
 
+	type restartItem struct {
+		url     string
+		reason  string
+		lastErr string
+	}
+	var restartCandidates []restartItem
+	if s.autoHealer != nil {
+		for _, u := range allURLs {
+			if wb := s.workerStates[u]; wb != nil && !wb.Healthy {
+				if shouldRestart, reason := s.autoHealer.ShouldRestart(wb.OpenSince, wb.LastErr); shouldRestart {
+					restartCandidates = append(restartCandidates, restartItem{
+						url:     u,
+						reason:  reason,
+						lastErr: wb.LastErr,
+					})
+				}
+			}
+		}
+	}
+
 	var healthyURLs []string
 	for _, u := range allURLs {
 		if wb := s.workerStates[u]; wb != nil && wb.Healthy {
@@ -1009,6 +1054,22 @@ func (s *Supervisor) probeRunnerWorkers(ctx context.Context, runner *ModelRunner
 		}
 	}
 	s.workerMu.Unlock()
+
+	for _, cand := range restartCandidates {
+		s.endpointsMu.RLock()
+		ep, hasMeta := s.endpointsMeta[cand.url]
+		s.endpointsMu.RUnlock()
+		if hasMeta && ep.InstanceID > 0 {
+			go func(targetEp gpustack.WorkerEndpoint, trigReason string, lastE string) {
+				crashPath, rErr := s.autoHealer.TriggerIncidentRestart(context.Background(), targetEp, trigReason, lastE)
+				if rErr != nil {
+					log.Printf("[Supervisor:AutoHeal] ❌ Auto-heal failed for %s (ID: %d): %v", targetEp.InstanceName, targetEp.InstanceID, rErr)
+				} else if crashPath != "" {
+					log.Printf("[Supervisor:AutoHeal] 🚀 Auto-heal initiated for %s (ID: %d). Crash report saved to %s", targetEp.InstanceName, targetEp.InstanceID, crashPath)
+				}
+			}(ep, cand.reason, cand.lastErr)
+		}
+	}
 
 	sort.Strings(healthyURLs)
 	sort.Strings(activeURLs)
@@ -1136,6 +1197,7 @@ func (s *Supervisor) watchLoop(ctx context.Context) {
 					log.Printf("[Supervisor] Warning: failed to query GPUStack instances for %s: %v", s.modelName, err)
 					continue
 				}
+				s.recordEndpointsMeta(endpoints)
 				var newURLs []string
 				for _, ep := range endpoints {
 					newURLs = append(newURLs, ep.URL)
@@ -1192,6 +1254,7 @@ func (s *Supervisor) watchLoop(ctx context.Context) {
 				// 1. Sync all active cluster worker states and prune obsolete endpoints
 				var allClusterURLs []string
 				for _, eps := range cluster.ModelsEndpoints {
+					s.recordEndpointsMeta(eps)
 					for _, ep := range eps {
 						allClusterURLs = append(allClusterURLs, ep.URL)
 					}

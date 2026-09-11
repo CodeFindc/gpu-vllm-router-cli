@@ -473,6 +473,7 @@ func main() {
 			if fileCfg.CircuitBreaker.MaxFailures > 0 {
 				supCfg.WorkerMaxFailures = fileCfg.CircuitBreaker.MaxFailures
 			}
+			supCfg.AutoHeal = fileCfg.AutoHeal
 		}
 		sup := router.NewSupervisor(client, *modelName, supCfg)
 		if err := sup.Start(ctx); err != nil {
@@ -537,6 +538,9 @@ func main() {
 			BalanceRelThreshold: balRelPtr,
 			CacheThreshold:      cacheThreshPtr,
 			ExtraArgs:           routerCfg.ExtraArgs,
+		}
+		if fileCfg != nil {
+			proxyCfg.AutoHeal = fileCfg.AutoHeal
 		}
 		srv := proxy.NewServer(proxyCfg, client)
 

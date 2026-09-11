@@ -73,6 +73,36 @@ type CircuitBreakerConfig struct {
 	DisableRetries         *bool         `yaml:"disable_retries,omitempty"`
 }
 
+// AutoHealConfig holds settings for automated instance restart and crash log preservation upon fatal failures.
+type AutoHealConfig struct {
+	Enabled            bool          `yaml:"enabled" json:"enabled"`
+	UnhealthyTimeout   time.Duration `yaml:"unhealthy_timeout" json:"unhealthy_timeout"`
+	FatalKeywords      []string      `yaml:"fatal_keywords" json:"fatal_keywords"`
+	CrashLogDir        string        `yaml:"crash_log_dir" json:"crash_log_dir"`
+	MaxRestartAttempts int           `yaml:"max_restart_attempts" json:"max_restart_attempts"`
+	RestartCooldown    time.Duration `yaml:"restart_cooldown" json:"restart_cooldown"`
+}
+
+// DefaultAutoHealConfig provides sensible production defaults.
+func DefaultAutoHealConfig() AutoHealConfig {
+	return AutoHealConfig{
+		Enabled:          false,
+		UnhealthyTimeout: 3 * time.Minute,
+		FatalKeywords: []string{
+			"CUDA out of memory",
+			"CUDA error",
+			"an illegal memory access",
+			"NCCL timeout",
+			"NCCL error",
+			"Engine is dead",
+			"RayActorError",
+		},
+		CrashLogDir:        "logs/crashes",
+		MaxRestartAttempts: 3,
+		RestartCooldown:    5 * time.Minute,
+	}
+}
+
 // ModelRule holds per-model routing override settings.
 type ModelRule struct {
 	ModelName           string   `yaml:"model_name" json:"model_name"`
@@ -90,6 +120,7 @@ type FileConfig struct {
 	Target         TargetConfig         `yaml:"target"`
 	Router         RouterConfig         `yaml:"router"`
 	CircuitBreaker CircuitBreakerConfig `yaml:"circuit_breaker"`
+	AutoHeal       AutoHealConfig       `yaml:"auto_heal"`
 	Models         []ModelRule          `yaml:"models,omitempty" json:"models,omitempty"`
 }
 

@@ -41,6 +41,7 @@ type ServerConfig struct {
 	BalanceRelThreshold *float64
 	CacheThreshold      *float64
 	ExtraArgs           []string
+	AutoHeal            config.AutoHealConfig
 }
 
 // ModelPool manages load balancing and active targets for a specific model.
@@ -162,6 +163,10 @@ type Server struct {
 	httpServer     *http.Server
 	reverseProxy   *httputil.ReverseProxy
 	stopCh         chan struct{}
+
+	endpointsMu   sync.RWMutex
+	endpointsMeta map[string]gpustack.WorkerEndpoint
+	autoHealer    *gpustack.AutoHealer
 }
 
 // NewServer creates a new reverse proxy Server.
@@ -191,6 +196,8 @@ func NewServer(cfg ServerConfig, client *gpustack.Client) *Server {
 		stopCh:         make(chan struct{}),
 		configFilePath: cfg.ConfigFilePath,
 		modelRules:     rulesMap,
+		endpointsMeta:  make(map[string]gpustack.WorkerEndpoint),
+		autoHealer:     gpustack.NewAutoHealer(client, cfg.AutoHeal),
 	}
 
 	// Custom ReverseProxy with RetryTransport
@@ -520,6 +527,28 @@ func (s *Server) Stop(ctx context.Context) error {
 	return nil
 }
 
+func (s *Server) recordEndpointsMeta(endpoints []gpustack.WorkerEndpoint) {
+	s.endpointsMu.Lock()
+	defer s.endpointsMu.Unlock()
+	for _, ep := range endpoints {
+		s.endpointsMeta[ep.URL] = ep
+	}
+}
+
+func (s *Server) pruneEndpointsMeta(activeURLs []string) {
+	activeSet := make(map[string]bool, len(activeURLs))
+	for _, u := range activeURLs {
+		activeSet[u] = true
+	}
+	s.endpointsMu.Lock()
+	defer s.endpointsMu.Unlock()
+	for u := range s.endpointsMeta {
+		if !activeSet[u] {
+			delete(s.endpointsMeta, u)
+		}
+	}
+}
+
 func (s *Server) findExistingTarget(urlStr string) *BackendTarget {
 	for _, t := range s.allTargets {
 		if t.URLString == urlStr {
@@ -530,6 +559,8 @@ func (s *Server) findExistingTarget(urlStr string) *BackendTarget {
 }
 
 func (s *Server) updateSingleModelEndpoints(modelName string, endpoints []gpustack.WorkerEndpoint) {
+	s.recordEndpointsMeta(endpoints)
+
 	s.mu.Lock()
 	defer s.mu.Unlock()
 
@@ -561,6 +592,7 @@ func (s *Server) updateSingleModelEndpoints(modelName string, endpoints []gpusta
 	}
 
 	sort.Strings(urls)
+	s.pruneEndpointsMeta(urls)
 	s.allTargets = targets
 	s.activeURLs = urls
 
@@ -588,6 +620,10 @@ func (s *Server) updateSingleModelEndpoints(modelName string, endpoints []gpusta
 }
 
 func (s *Server) updateClusterEndpoints(cluster *gpustack.ClusterEndpoints) {
+	for _, endpoints := range cluster.ModelsEndpoints {
+		s.recordEndpointsMeta(endpoints)
+	}
+
 	s.mu.Lock()
 	defer s.mu.Unlock()
 
@@ -662,6 +698,7 @@ func (s *Server) updateClusterEndpoints(cluster *gpustack.ClusterEndpoints) {
 	}
 
 	sort.Strings(allURLs)
+	s.pruneEndpointsMeta(allURLs)
 	s.modelPools = newPools
 	s.allTargets = allTargets
 	s.activeURLs = allURLs
@@ -697,6 +734,22 @@ func (s *Server) probeLoop(ctx context.Context) {
 					go func(target *BackendTarget) {
 						if target.CircuitBreaker.Probe() {
 							log.Printf("[Proxy:Probe] 🟢 Target %s self-healing probe succeeded! Restored to CLOSED", target.URLString)
+						} else if s.autoHealer != nil {
+							_, _, openSince := target.CircuitBreaker.GetStatus()
+							_, lastErr := target.CircuitBreaker.GetLastProbeAndError()
+							if shouldRestart, reason := s.autoHealer.ShouldRestart(openSince, lastErr); shouldRestart {
+								s.endpointsMu.RLock()
+								ep, hasMeta := s.endpointsMeta[target.URLString]
+								s.endpointsMu.RUnlock()
+								if hasMeta && ep.InstanceID > 0 {
+									crashPath, rErr := s.autoHealer.TriggerIncidentRestart(context.Background(), ep, reason, lastErr)
+									if rErr != nil {
+										log.Printf("[Proxy:AutoHeal] ❌ Auto-heal failed for %s (ID: %d): %v", ep.InstanceName, ep.InstanceID, rErr)
+									} else if crashPath != "" {
+										log.Printf("[Proxy:AutoHeal] 🚀 Auto-heal initiated for %s (ID: %d). Crash report saved to %s", ep.InstanceName, ep.InstanceID, crashPath)
+									}
+								}
+							}
 						}
 					}(t)
 				}
