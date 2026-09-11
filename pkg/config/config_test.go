@@ -320,5 +320,37 @@ func TestLoadConfigExampleYaml(t *testing.T) {
 	if cfg.CircuitBreaker.HealthCheckEndpoint != "/health" {
 		t.Errorf("expected health_check_endpoint /health, got %s", cfg.CircuitBreaker.HealthCheckEndpoint)
 	}
+	if cfg.Router.LogDir != "/app/logs/vllm-router" {
+		t.Errorf("expected log_dir /app/logs/vllm-router, got %s", cfg.Router.LogDir)
+	}
+	if cfg.Router.LogFile != "/app/logs/router.log" {
+		t.Errorf("expected log_file /app/logs/router.log, got %s", cfg.Router.LogFile)
+	}
+}
+
+func TestModelRuleLogDir(t *testing.T) {
+	yamlContent := `
+router:
+  log_dir: "/app/logs/vllm-router"
+models:
+  - model_name: "custom-model"
+    log_dir: "/custom/log/dir"
+`
+	tmpFile := filepath.Join(t.TempDir(), "config.yaml")
+	if err := os.WriteFile(tmpFile, []byte(yamlContent), 0644); err != nil {
+		t.Fatalf("failed to write temp file: %v", err)
+	}
+
+	cfg, err := LoadConfig(tmpFile)
+	if err != nil {
+		t.Fatalf("LoadConfig failed: %v", err)
+	}
+
+	if len(cfg.Models) != 1 {
+		t.Fatalf("expected 1 model rule, got %d", len(cfg.Models))
+	}
+	if cfg.Models[0].LogDir != "/custom/log/dir" {
+		t.Errorf("expected model custom log_dir /custom/log/dir, got %s", cfg.Models[0].LogDir)
+	}
 }
 

@@ -15,6 +15,7 @@ import (
 	"net/url"
 	"os"
 	"os/exec"
+	"path/filepath"
 	"reflect"
 	"sort"
 	"strings"
@@ -871,12 +872,14 @@ func (s *Supervisor) spawnProcess(ctx context.Context, host string, port int, wo
 	return s.spawnProcessForModel(ctx, "", host, port, workerURLs)
 }
 
-func (s *Supervisor) spawnProcessForModel(ctx context.Context, modelName string, host string, port int, workerURLs []string) (*runningProcess, error) {
+// buildModelConfig resolves router configuration, per-model overrides, and isolated log directories.
+func (s *Supervisor) buildModelConfig(modelName string, host string, port int, workerURLs []string) Config {
 	cfg := s.cfg.RouterCfg
 	cfg.Host = host
 	cfg.Port = port
 	cfg.WorkerURLs = workerURLs
 
+	var hasCustomLogDir bool
 	if modelName != "" {
 		s.mu.RLock()
 		rule, ok := s.modelRules[modelName]
@@ -896,6 +899,10 @@ func (s *Supervisor) spawnProcessForModel(ctx context.Context, modelName string,
 			if rule.CacheThreshold != nil && *rule.CacheThreshold > 0 {
 				cfg.CacheThreshold = *rule.CacheThreshold
 			}
+			if rule.LogDir != "" {
+				cfg.LogDir = rule.LogDir
+				hasCustomLogDir = true
+			}
 			if len(rule.ExtraArgs) > 0 {
 				cfg.ExtraArgs = rule.ExtraArgs
 			}
@@ -906,6 +913,27 @@ func (s *Supervisor) spawnProcessForModel(ctx context.Context, modelName string,
 		cfg.LogLevel = "debug"
 	}
 
+	if cfg.LogDir != "" {
+		if modelName != "" && !hasCustomLogDir {
+			cleanModel := strings.ReplaceAll(modelName, "/", "_")
+			cleanModel = strings.ReplaceAll(cleanModel, "\\", "_")
+			cleanModel = strings.ReplaceAll(cleanModel, ":", "_")
+			cfg.LogDir = filepath.Join(s.cfg.RouterCfg.LogDir, cleanModel)
+		}
+		if err := os.MkdirAll(cfg.LogDir, 0755); err != nil {
+			log.Printf("[Supervisor] Warning: failed to create log directory %q: %v", cfg.LogDir, err)
+		}
+	}
+
+	return cfg
+}
+
+func (s *Supervisor) spawnProcessForModel(ctx context.Context, modelName string, host string, port int, workerURLs []string) (*runningProcess, error) {
+	if s.spawnProcessFunc != nil {
+		return s.spawnProcessFunc(ctx, host, port, workerURLs)
+	}
+
+	cfg := s.buildModelConfig(modelName, host, port, workerURLs)
 	args := BuildArgs(cfg)
 	bin := cfg.RouterBin
 	if bin == "" {

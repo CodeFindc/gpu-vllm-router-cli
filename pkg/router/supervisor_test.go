@@ -5,6 +5,7 @@ import (
 	"net/http"
 	"net/http/httptest"
 	"net/url"
+	"os"
 	"path/filepath"
 	"strconv"
 	"strings"
@@ -400,6 +401,55 @@ func TestSupervisor_ClientContextCanceledDoesNotTriggerProbe(t *testing.T) {
 	}
 	if rr.Code == http.StatusBadGateway {
 		t.Errorf("expected no 502 Bad Gateway written for client-side cancellation, got status %d", rr.Code)
+	}
+}
+
+func TestSupervisor_ModelLogDirIsolation(t *testing.T) {
+	tmpDir := t.TempDir()
+	baseLogDir := filepath.Join(tmpDir, "vllm-logs")
+
+	sup := &Supervisor{
+		cfg: SupervisorConfig{
+			RouterCfg: Config{
+				LogDir: baseLogDir,
+			},
+		},
+		modelRules: map[string]config.ModelRule{
+			"custom-log-model": {
+				ModelName: "custom-log-model",
+				LogDir:    filepath.Join(tmpDir, "custom-isolated-logs"),
+			},
+		},
+	}
+
+	// 1. Multi-model default isolation
+	modelA := "deepseek-ai/DeepSeek-V3"
+	cfgA := sup.buildModelConfig(modelA, "127.0.0.1", 18000, []string{"http://10.0.0.1:8000"})
+	expectedDirA := filepath.Join(baseLogDir, "deepseek-ai_DeepSeek-V3")
+	if cfgA.LogDir != expectedDirA {
+		t.Errorf("expected isolated log dir %q, got %q", expectedDirA, cfgA.LogDir)
+	}
+	if fi, err := os.Stat(cfgA.LogDir); err != nil || !fi.IsDir() {
+		t.Errorf("expected log dir %q to exist on disk as directory: %v", cfgA.LogDir, err)
+	}
+
+	// 2. Custom rule log dir override
+	cfgCustom := sup.buildModelConfig("custom-log-model", "127.0.0.1", 18001, []string{"http://10.0.0.2:8000"})
+	expectedCustomDir := filepath.Join(tmpDir, "custom-isolated-logs")
+	if cfgCustom.LogDir != expectedCustomDir {
+		t.Errorf("expected custom log dir %q, got %q", expectedCustomDir, cfgCustom.LogDir)
+	}
+	if fi, err := os.Stat(cfgCustom.LogDir); err != nil || !fi.IsDir() {
+		t.Errorf("expected custom log dir %q to exist on disk: %v", cfgCustom.LogDir, err)
+	}
+
+	// 3. Single-model mode (empty model name)
+	cfgEmpty := sup.buildModelConfig("", "127.0.0.1", 18002, []string{"http://10.0.0.3:8000"})
+	if cfgEmpty.LogDir != baseLogDir {
+		t.Errorf("expected base log dir %q, got %q", baseLogDir, cfgEmpty.LogDir)
+	}
+	if fi, err := os.Stat(cfgEmpty.LogDir); err != nil || !fi.IsDir() {
+		t.Errorf("expected base log dir %q to exist on disk: %v", cfgEmpty.LogDir, err)
 	}
 }
 

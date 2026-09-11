@@ -55,8 +55,12 @@ router:
   # 路由器日志输出级别 (对应官方 --log-level: debug, info, warn, error)
   log_level: "info"
 
-  # 路由器日志保存目录 (可选，对应官方 --log-dir)
-  # log_dir: "/var/log/vllm-router"
+  # 官方 vllm-router 原生滚动日志保存目录 (可选，对应官方 --log-dir)
+  # 容器化部署时挂载为 /app/logs/vllm-router，将自动持久化到宿主机 ./logs/vllm-router
+  log_dir: "/app/logs/vllm-router"
+
+  # 调度器汇总运行物理日志文件 (可选，启用后实时双写标准输出与宿主机 ./logs/router.log，off 禁用)
+  log_file: "/app/logs/router.log"
 
   # 后台定时轮询 GPUStack 感知实例增删与节点状态变化的间隔
   watch_interval: 10s

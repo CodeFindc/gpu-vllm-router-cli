@@ -4,9 +4,11 @@ import (
 	"context"
 	"flag"
 	"fmt"
+	"io"
 	"log"
 	"os"
 	"os/signal"
+	"path/filepath"
 	"strings"
 	"syscall"
 	"time"
@@ -28,6 +30,48 @@ func printHelpBanner() {
 	fmt.Println(`===================================================================`)
 	fmt.Println(`   GPUStack -> vLLM-Router 动态实例发现与调度工具 (CLI)`)
 	fmt.Println(`===================================================================`)
+}
+
+func setupLogging(configuredPath string, mode string) func() {
+	if mode == "cmd" {
+		return func() {}
+	}
+	if strings.EqualFold(configuredPath, "off") || strings.EqualFold(configuredPath, "none") {
+		return func() {}
+	}
+
+	targetFile := configuredPath
+	if targetFile == "" {
+		if fi, err := os.Stat("/app/logs"); err == nil && fi.IsDir() {
+			targetFile = "/app/logs/router.log"
+		} else if fi, err := os.Stat("logs"); err == nil && fi.IsDir() {
+			targetFile = "logs/router.log"
+		}
+	}
+	if targetFile == "" {
+		return func() {}
+	}
+
+	dir := filepath.Dir(targetFile)
+	if err := os.MkdirAll(dir, 0755); err != nil {
+		log.Printf("警告: 创建物理日志目录 %q 失败: %v", dir, err)
+		return func() {}
+	}
+
+	f, err := os.OpenFile(targetFile, os.O_CREATE|os.O_WRONLY|os.O_APPEND, 0644)
+	if err != nil {
+		log.Printf("警告: 打开物理日志文件 %q 失败: %v", targetFile, err)
+		return func() {}
+	}
+
+	mw := io.MultiWriter(os.Stderr, f)
+	log.SetOutput(mw)
+	log.Printf("物理运行日志双写落盘已启用 -> %s", targetFile)
+
+	return func() {
+		_ = f.Sync()
+		_ = f.Close()
+	}
 }
 
 func main() {
@@ -72,6 +116,7 @@ func main() {
 	backendFlag := flag.String("backend", "vllm", "后端推理引擎类型 (vllm, sglang, trtllm, openai, anthropic)")
 	logLevelFlag := flag.String("log-level", "info", "路由器日志级别 (debug, info, warn, error)")
 	logDirFlag := flag.String("log-dir", "", "路由器日志存储目录")
+	logFileFlag := flag.String("log-file", "", "调度器主控与各子进程汇总运行物理日志文件路径 (如 logs/router.log, off 可禁用)")
 
 	// PD Disaggregation Flags
 	pdDisaggFlag := flag.Bool("vllm-pd-disaggregation", false, "是否开启 Prefill-Decode 两阶段分离路由模式")
@@ -170,6 +215,9 @@ func main() {
 		if !explicitFlags["log-dir"] && fileCfg.Router.LogDir != "" {
 			*logDirFlag = fileCfg.Router.LogDir
 		}
+		if !explicitFlags["log-file"] && fileCfg.Router.LogFile != "" {
+			*logFileFlag = fileCfg.Router.LogFile
+		}
 		if !explicitFlags["eviction-interval"] && fileCfg.Router.EvictionInterval != nil {
 			*evictionIntervalFlag = *fileCfg.Router.EvictionInterval
 		}
@@ -198,6 +246,9 @@ func main() {
 			*workerStartupCheckIntervalFlag = *fileCfg.Router.WorkerStartupCheckInterval
 		}
 	}
+
+	cleanupLogger := setupLogging(*logFileFlag, *mode)
+	defer cleanupLogger()
 
 	// 1. If user requested --list-policies
 	if *listPolicies {

@@ -32,6 +32,7 @@ type RouterConfig struct {
 	Backend                    string        `yaml:"backend,omitempty"`
 	LogLevel                   string        `yaml:"log_level,omitempty"`
 	LogDir                     string        `yaml:"log_dir,omitempty"`
+	LogFile                    string        `yaml:"log_file,omitempty"`
 	WatchInterval              time.Duration `yaml:"watch_interval"`
 	DataParallelSize           int           `yaml:"data_parallel_size"`
 	ZeroDowntime               *bool         `yaml:"zero_downtime"`
@@ -111,6 +112,7 @@ type ModelRule struct {
 	BalanceAbsThreshold *int     `yaml:"balance_abs_threshold,omitempty" json:"balance_abs_threshold,omitempty"`
 	BalanceRelThreshold *float64 `yaml:"balance_rel_threshold,omitempty" json:"balance_rel_threshold,omitempty"`
 	CacheThreshold      *float64 `yaml:"cache_threshold,omitempty" json:"cache_threshold,omitempty"`
+	LogDir              string   `yaml:"log_dir,omitempty" json:"log_dir,omitempty"`
 	ExtraArgs           []string `yaml:"extra_args,omitempty" json:"extra_args,omitempty"`
 }
 
