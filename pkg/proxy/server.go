@@ -30,6 +30,7 @@ import (
 type ServerConfig struct {
 	Host                string
 	Port                int
+	MetricsPort         int
 	Policy              router.Policy
 	ModelName           string // If empty, operates in full-cluster multi-model mode
 	WatchInterval       time.Duration
@@ -162,6 +163,7 @@ type Server struct {
 	configFilePath string
 	modelRules     map[string]config.ModelRule
 	httpServer     *http.Server
+	metricsServer  *http.Server
 	reverseProxy   *httputil.ReverseProxy
 	stopCh         chan struct{}
 
@@ -177,6 +179,9 @@ func NewServer(cfg ServerConfig, client *gpustack.Client) *Server {
 	}
 	if cfg.Port <= 0 {
 		cfg.Port = 8000
+	}
+	if cfg.MetricsPort == 0 {
+		cfg.MetricsPort = 29000
 	}
 	if cfg.WatchInterval <= 0 {
 		cfg.WatchInterval = 10 * time.Second
@@ -560,6 +565,26 @@ func (s *Server) Start(ctx context.Context) error {
 		addr, s.cfg.Policy, s.cfg.CircuitBreaker.MaxRetries)
 	log.Printf("[Proxy] Swagger UI documentation: http://%s/docs (OpenAPI spec: /openapi.json)", addr)
 
+	if s.cfg.MetricsPort > 0 && s.cfg.MetricsPort != s.cfg.Port {
+		metricsMux := http.NewServeMux()
+		metricsMux.HandleFunc("/metrics", s.handleMetrics)
+		metricsMux.HandleFunc("/health", func(w http.ResponseWriter, r *http.Request) {
+			w.WriteHeader(http.StatusOK)
+			_, _ = w.Write([]byte("OK"))
+		})
+		metricsAddr := fmt.Sprintf("%s:%d", s.cfg.Host, s.cfg.MetricsPort)
+		s.metricsServer = &http.Server{
+			Addr:    metricsAddr,
+			Handler: metricsMux,
+		}
+		go func() {
+			log.Printf("[Proxy] Prometheus 专用监控服务已启动: http://%s/metrics", metricsAddr)
+			if err := s.metricsServer.ListenAndServe(); err != nil && err != http.ErrServerClosed {
+				log.Printf("[Proxy] Prometheus 监控服务退出: %v", err)
+			}
+		}()
+	}
+
 	if err := s.httpServer.ListenAndServe(); err != nil && err != http.ErrServerClosed {
 		return fmt.Errorf("proxy server failed: %w", err)
 	}
@@ -570,6 +595,9 @@ func (s *Server) Start(ctx context.Context) error {
 // Stop gracefully shuts down the proxy server.
 func (s *Server) Stop(ctx context.Context) error {
 	close(s.stopCh)
+	if s.metricsServer != nil {
+		_ = s.metricsServer.Shutdown(ctx)
+	}
 	if s.httpServer != nil {
 		return s.httpServer.Shutdown(ctx)
 	}
@@ -1023,6 +1051,45 @@ func (s *Server) handleMetrics(w http.ResponseWriter, r *http.Request) {
 
 	var buf bytes.Buffer
 
+	// 1. Official vLLM Ecosystem Standard Metrics (vllm_router_*)
+	buf.WriteString("# HELP vllm_router_processed_requests_total Total number of successfully processed requests per worker\n")
+	buf.WriteString("# TYPE vllm_router_processed_requests_total counter\n")
+	for mName, pool := range pools {
+		for _, t := range pool.Targets {
+			var succ int64
+			if t.CircuitBreaker != nil {
+				_, _, succ, _ = t.CircuitBreaker.GetMetrics()
+			}
+			fmt.Fprintf(&buf, "vllm_router_processed_requests_total{model=%q,worker=%q} %d\n", mName, t.URLString, succ)
+		}
+	}
+	buf.WriteString("\n")
+
+	buf.WriteString("# HELP vllm_router_running_requests Number of requests currently running on worker\n")
+	buf.WriteString("# TYPE vllm_router_running_requests gauge\n")
+	for mName, pool := range pools {
+		for _, t := range pool.Targets {
+			active := atomic.LoadInt64(&t.ActiveConns)
+			fmt.Fprintf(&buf, "vllm_router_running_requests{model=%q,worker=%q} %d\n", mName, t.URLString, active)
+		}
+	}
+	buf.WriteString("\n")
+
+	buf.WriteString("# HELP vllm_router_cb_outcomes_total Circuit breaker invocation outcomes per worker\n")
+	buf.WriteString("# TYPE vllm_router_cb_outcomes_total counter\n")
+	for mName, pool := range pools {
+		for _, t := range pool.Targets {
+			var succ, fails int64
+			if t.CircuitBreaker != nil {
+				_, _, succ, fails = t.CircuitBreaker.GetMetrics()
+			}
+			fmt.Fprintf(&buf, "vllm_router_cb_outcomes_total{model=%q,outcome=\"success\",worker=%q} %d\n", mName, t.URLString, succ)
+			fmt.Fprintf(&buf, "vllm_router_cb_outcomes_total{model=%q,outcome=\"failure\",worker=%q} %d\n", mName, t.URLString, fails)
+		}
+	}
+	buf.WriteString("\n")
+
+	// 2. Legacy gpu_router_* metrics for backward compatibility
 	buf.WriteString("# HELP gpu_router_models_total Total number of registered active models\n")
 	buf.WriteString("# TYPE gpu_router_models_total gauge\n")
 	fmt.Fprintf(&buf, "gpu_router_models_total %d\n\n", len(pools))

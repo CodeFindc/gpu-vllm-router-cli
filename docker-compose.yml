@@ -14,6 +14,7 @@ services:
     restart: unless-stopped
     ports:
       - "8000:8000"
+      - "29000:29000" # Prometheus 标准监控指标端口 (vllm_router_* 兼容)
     # 高性能 GPU 集群场景下若需极低网络开销，可开启 host 网络模式：
     # network_mode: "host"
     volumes:

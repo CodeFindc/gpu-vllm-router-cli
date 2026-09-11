@@ -267,4 +267,71 @@ func TestProxyFailoverTransparentRetry(t *testing.T) {
 	if !strings.Contains(metricsText, "gpu_router_models_total") || !strings.Contains(metricsText, "gpu_router_backend_healthy") {
 		t.Errorf("Expected Prometheus metrics to contain router stats, got:\n%s", metricsText)
 	}
+
+	// Assert official vllm-project/router metrics compatibility
+	expectedStandardMetrics := []string{
+		"vllm_router_processed_requests_total",
+		"vllm_router_running_requests",
+		"vllm_router_cb_outcomes_total",
+		"outcome=\"success\"",
+		"outcome=\"failure\"",
+	}
+	for _, m := range expectedStandardMetrics {
+		if !strings.Contains(metricsText, m) {
+			t.Errorf("Expected Prometheus metrics to contain official standard metric %q, got:\n%s", m, metricsText)
+		}
+	}
+}
+
+func TestProxy_PrometheusMetrics(t *testing.T) {
+	srv := NewServer(ServerConfig{
+		Host:        "127.0.0.1",
+		Port:        8000,
+		MetricsPort: 29000,
+	}, nil)
+
+	u, _ := url.Parse("http://10.0.0.1:8000")
+	cb := NewCircuitBreaker(u.String(), DefaultCircuitBreakerConfig())
+	cb.RecordSuccess()
+	cb.RecordFailure(errors.New("connection reset"))
+
+	target := &BackendTarget{
+		URL:            u,
+		URLString:      u.String(),
+		CircuitBreaker: cb,
+	}
+	atomic.StoreInt64(&target.ActiveConns, 5)
+
+	srv.modelPools["deepseek-r1"] = &ModelPool{
+		ModelName: "deepseek-r1",
+		Targets:   []*BackendTarget{target},
+	}
+	srv.allTargets = []*BackendTarget{target}
+
+	rec := httptest.NewRecorder()
+	req := httptest.NewRequest(http.MethodGet, "/metrics", nil)
+	srv.handleMetrics(rec, req)
+
+	resp := rec.Result()
+	if resp.StatusCode != http.StatusOK {
+		t.Fatalf("expected HTTP 200, got %d", resp.StatusCode)
+	}
+
+	body, _ := io.ReadAll(resp.Body)
+	text := string(body)
+
+	expected := []string{
+		"vllm_router_processed_requests_total{model=\"deepseek-r1\",worker=\"http://10.0.0.1:8000\"} 1",
+		"vllm_router_running_requests{model=\"deepseek-r1\",worker=\"http://10.0.0.1:8000\"} 5",
+		"vllm_router_cb_outcomes_total{model=\"deepseek-r1\",outcome=\"success\",worker=\"http://10.0.0.1:8000\"} 1",
+		"vllm_router_cb_outcomes_total{model=\"deepseek-r1\",outcome=\"failure\",worker=\"http://10.0.0.1:8000\"} 1",
+		"gpu_router_models_total 1",
+		"gpu_router_backend_healthy",
+	}
+
+	for _, exp := range expected {
+		if !strings.Contains(text, exp) {
+			t.Errorf("expected metrics to contain %q, but got:\n%s", exp, text)
+		}
+	}
 }

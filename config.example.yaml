@@ -46,6 +46,9 @@ router:
   host: "0.0.0.0"
   port: 8000
 
+  # Prometheus 标准监控指标独立暴露端口 (对应官方 29000 端口规范，设置为 0 则仅在 8000/metrics 输出)
+  metrics_port: 29000
+
   # 官方 vllm-router 可执行文件路径 (run / cmd 模式下使用)
   router_bin: "vllm-router"
 

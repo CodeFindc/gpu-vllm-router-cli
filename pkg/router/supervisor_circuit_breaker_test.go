@@ -383,3 +383,53 @@ func TestSupervisor_WorkerPortChangeDynamicReload(t *testing.T) {
 		t.Errorf("expected runner ActiveURLs updated to %v, got %v", []string{newWorker}, activeURLs)
 	}
 }
+
+func TestSupervisor_PrometheusMetrics(t *testing.T) {
+	workerURL := "http://10.0.0.1:8000"
+	sup := &Supervisor{
+		modelName:    "Qwen3.6-27B",
+		runners:      make(map[string]*ModelRunner),
+		workerStates: make(map[string]*WorkerBreaker),
+		stopCh:       make(chan struct{}),
+	}
+
+	runner := &ModelRunner{
+		ModelName:  "Qwen3.6-27B",
+		ActiveURLs: []string{workerURL},
+	}
+	sup.runners["Qwen3.6-27B"] = runner
+	sup.workerStates[workerURL] = &WorkerBreaker{
+		URL:             workerURL,
+		Healthy:         true,
+		TotalSuccesses:  42,
+		TotalFailures:   2,
+		RunningRequests: 3,
+	}
+
+	req := httptest.NewRequest(http.MethodGet, "/metrics", nil)
+	rec := httptest.NewRecorder()
+	sup.handleMetrics(rec, req)
+
+	resp := rec.Result()
+	if resp.StatusCode != http.StatusOK {
+		t.Fatalf("expected HTTP 200 from /metrics, got %d", resp.StatusCode)
+	}
+
+	body := rec.Body.String()
+	expectedSubstrings := []string{
+		"vllm_router_processed_requests_total",
+		"vllm_router_running_requests",
+		"vllm_router_cb_outcomes_total",
+		"outcome=\"success\"",
+		"outcome=\"failure\"",
+		workerURL,
+		"gpu_router_models_total 1",
+		"gpu_router_worker_health",
+	}
+
+	for _, s := range expectedSubstrings {
+		if !strings.Contains(body, s) {
+			t.Errorf("expected /metrics output to contain %q, but got:\n%s", s, body)
+		}
+	}
+}

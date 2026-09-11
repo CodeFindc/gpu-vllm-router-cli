@@ -111,6 +111,7 @@ func main() {
 	routerBin := flag.String("router-bin", "vllm-router", "vllm-router 可执行文件路径")
 	host := flag.String("host", "0.0.0.0", "路由器绑定监听地址")
 	port := flag.Int("port", 8000, "路由器绑定监听端口")
+	metricsPort := flag.Int("metrics-port", 29000, "Prometheus 专用指标导出端口 (默认 29000，设为 0 可禁用独立端口)")
 	watchInterval := flag.Duration("watch-interval", 10*time.Second, "动态实例状态感知轮询间隔 (例如 10s, 30s)")
 	dpSize := flag.Int("dp-size", 1, "数据并行度 (intra-node data parallel size)")
 	zeroDowntime := flag.Bool("zero-downtime", true, "run 模式是否启用蓝绿双进程零停机平滑滚动热重载 (推荐开启)")
@@ -194,6 +195,9 @@ func main() {
 		}
 		if !explicitFlags["port"] && fileCfg.Router.Port > 0 {
 			*port = fileCfg.Router.Port
+		}
+		if !explicitFlags["metrics-port"] && fileCfg.Router.MetricsPort != nil {
+			*metricsPort = *fileCfg.Router.MetricsPort
 		}
 		if !explicitFlags["router-bin"] && fileCfg.Router.RouterBin != "" {
 			*routerBin = fileCfg.Router.RouterBin
@@ -514,7 +518,8 @@ func main() {
 		fmt.Printf("  - OpenAPI 3.0 规范: http://127.0.0.1:%d/openapi.json\n", *port)
 		fmt.Printf("  - 健康检查探针:     http://127.0.0.1:%d/health\n", *port)
 		fmt.Printf("  - 集群拓扑 API:     http://127.0.0.1:%d/api/topology\n", *port)
-		fmt.Printf("  - Prometheus 监控:  http://127.0.0.1:%d/metrics\n", *port)
+		fmt.Printf("  - Prometheus 统一监控指标: http://127.0.0.1:%d/metrics\n", *metricsPort)
+		fmt.Printf("  - Prometheus 备用监控指标: http://127.0.0.1:%d/metrics\n", *port)
 
 	case "run":
 		log.Printf("正在以守护进程模式启动官方 vllm-router (%s)...", *routerBin)
@@ -531,6 +536,7 @@ func main() {
 			ZeroDowntime:   *zeroDowntime,
 			PublicHost:     *host,
 			PublicPort:     *port,
+			MetricsPort:    *metricsPort,
 			DrainTimeout:   *drainTimeout,
 			WatchInterval:  *watchInterval,
 			RouterCfg:      routerCfg,
@@ -597,6 +603,7 @@ func main() {
 		proxyCfg := proxy.ServerConfig{
 			Host:                *host,
 			Port:                *port,
+			MetricsPort:         *metricsPort,
 			Policy:              selectedPolicy,
 			ModelName:           *modelName,
 			WatchInterval:       *watchInterval,

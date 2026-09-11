@@ -66,8 +66,8 @@ COPY config.example.yaml /app/config.yaml
 RUN mkdir -p /app/logs
 VOLUME ["/app/logs"]
 
-# 暴露对外统一服务端口 (包含 OpenAI 接口与 Swagger/ReDoc 接口文档)
-EXPOSE 8000
+# 暴露对外统一服务端口 (8000: OpenAI/Swagger文档, 29000: Prometheus Metrics 专用监控)
+EXPOSE 8000 29000
 
 # 容器健康检查
 HEALTHCHECK --interval=15s --timeout=5s --start-period=10s --retries=3 \

@@ -28,6 +28,7 @@ type RouterConfig struct {
 	Mode                       string        `yaml:"mode"`
 	Host                       string        `yaml:"host"`
 	Port                       int           `yaml:"port"`
+	MetricsPort                *int          `yaml:"metrics_port,omitempty"`
 	RouterBin                  string        `yaml:"router_bin"`
 	Backend                    string        `yaml:"backend,omitempty"`
 	LogLevel                   string        `yaml:"log_level,omitempty"`

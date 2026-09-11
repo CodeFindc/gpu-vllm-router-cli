@@ -17,6 +17,8 @@ type Config struct {
 	Backend           string   `json:"backend"`            // default "vllm"
 	LogLevel          string   `json:"log_level"`          // default "info"
 	LogDir            string   `json:"log_dir,omitempty"`
+	PrometheusHost    string   `json:"prometheus_host,omitempty"`
+	PrometheusPort    int      `json:"prometheus_port,omitempty"`
 	VllmPDDisagg      bool     `json:"vllm_pd_disaggregation"`
 	VllmDiscoveryAddress string `json:"vllm_discovery_address,omitempty"`
 	PrefillPolicy     string   `json:"prefill_policy,omitempty"`
@@ -97,6 +99,13 @@ func BuildArgs(cfg Config) []string {
 
 	if cfg.LogDir != "" {
 		args = append(args, "--log-dir", cfg.LogDir)
+	}
+
+	if cfg.PrometheusHost != "" {
+		args = append(args, "--prometheus-host", cfg.PrometheusHost)
+	}
+	if cfg.PrometheusPort > 0 {
+		args = append(args, "--prometheus-port", fmt.Sprintf("%d", cfg.PrometheusPort))
 	}
 
 	if cfg.VllmPDDisagg {

@@ -38,6 +38,9 @@ type WorkerBreaker struct {
 	LastErr          string    `json:"last_error,omitempty"`
 	Healthy          bool      `json:"healthy"`
 	OpenSince        time.Time `json:"open_since,omitempty"`
+	TotalSuccesses   int64     `json:"total_successes"`
+	TotalFailures    int64     `json:"total_failures"`
+	RunningRequests  int64     `json:"running_requests"`
 }
 
 // SupervisorConfig defines configuration for the router supervisor.
@@ -45,6 +48,7 @@ type SupervisorConfig struct {
 	ZeroDowntime        bool
 	PublicHost          string
 	PublicPort          int
+	MetricsPort         int
 	DrainTimeout        time.Duration
 	HealthCheckTimeout  time.Duration
 	WatchInterval       time.Duration
@@ -102,8 +106,9 @@ type Supervisor struct {
 	endpointsMeta map[string]gpustack.WorkerEndpoint
 	autoHealer    *gpustack.AutoHealer
 
-	frontServer *http.Server
-	stopCh      chan struct{}
+	frontServer   *http.Server
+	metricsServer *http.Server
+	stopCh        chan struct{}
 
 	spawnProcessFunc  func(ctx context.Context, host string, port int, workerURLs []string) (*runningProcess, error)
 	probeWorkerFunc   func(ctx context.Context, rawURL string) (bool, error)
@@ -117,6 +122,9 @@ func NewSupervisor(client *gpustack.Client, modelName string, cfg SupervisorConf
 	}
 	if cfg.PublicPort <= 0 {
 		cfg.PublicPort = 8000
+	}
+	if cfg.MetricsPort == 0 {
+		cfg.MetricsPort = 29000
 	}
 	if cfg.WatchInterval <= 0 {
 		cfg.WatchInterval = 10 * time.Second
@@ -435,6 +443,28 @@ func (s *Supervisor) Start(ctx context.Context) error {
 		Handler: mux,
 	}
 
+	if s.cfg.MetricsPort > 0 && s.cfg.MetricsPort != s.cfg.PublicPort {
+		metricsMux := http.NewServeMux()
+		metricsMux.HandleFunc("/metrics", s.handleMetrics)
+		metricsMux.HandleFunc("/health", s.handleHealth)
+		metricsMux.HandleFunc("/healthz", s.handleHealth)
+		metricsMux.HandleFunc("/livez", s.handleHealth)
+		metricsMux.HandleFunc("/readyz", s.handleHealth)
+		metricsMux.HandleFunc("/ping", s.handleHealth)
+
+		metricsAddr := fmt.Sprintf("%s:%d", s.cfg.PublicHost, s.cfg.MetricsPort)
+		s.metricsServer = &http.Server{
+			Addr:    metricsAddr,
+			Handler: metricsMux,
+		}
+		go func() {
+			log.Printf("[Supervisor] Prometheus metrics exporter listening on http://%s/metrics", metricsAddr)
+			if err := s.metricsServer.ListenAndServe(); err != nil && err != http.ErrServerClosed {
+				log.Printf("[Supervisor] Prometheus metrics server error: %v", err)
+			}
+		}()
+	}
+
 	go func() {
 		log.Printf("[Supervisor] Front Gateway listening on http://%s (Managing %d model router processes, Zero-Downtime=%t)",
 			addr, len(s.runners), s.cfg.ZeroDowntime)
@@ -627,8 +657,14 @@ func (s *Supervisor) handleMetrics(w http.ResponseWriter, r *http.Request) {
 	s.mu.RLock()
 	modelCount := len(s.runners)
 	runners := make([]*ModelRunner, 0, modelCount)
-	for _, r := range s.runners {
-		runners = append(runners, r)
+	workerToModel := make(map[string]string)
+	for _, runner := range s.runners {
+		runners = append(runners, runner)
+		runner.mu.RLock()
+		for _, u := range runner.ActiveURLs {
+			workerToModel[u] = runner.ModelName
+		}
+		runner.mu.RUnlock()
 	}
 	s.mu.RUnlock()
 
@@ -641,6 +677,55 @@ func (s *Supervisor) handleMetrics(w http.ResponseWriter, r *http.Request) {
 
 	var buf bytes.Buffer
 
+	// 1. Official vLLM Ecosystem Standard Metrics (vllm_router_*)
+	buf.WriteString("# HELP vllm_router_processed_requests_total Total number of successfully processed requests per worker\n")
+	buf.WriteString("# TYPE vllm_router_processed_requests_total counter\n")
+	for u, wb := range workers {
+		mName := workerToModel[u]
+		if mName == "" && s.modelName != "" {
+			mName = s.modelName
+		}
+		if mName != "" {
+			fmt.Fprintf(&buf, "vllm_router_processed_requests_total{model=%q,worker=%q} %d\n", mName, u, wb.TotalSuccesses)
+		} else {
+			fmt.Fprintf(&buf, "vllm_router_processed_requests_total{worker=%q} %d\n", u, wb.TotalSuccesses)
+		}
+	}
+	buf.WriteString("\n")
+
+	buf.WriteString("# HELP vllm_router_running_requests Number of requests currently running on worker\n")
+	buf.WriteString("# TYPE vllm_router_running_requests gauge\n")
+	for u, wb := range workers {
+		mName := workerToModel[u]
+		if mName == "" && s.modelName != "" {
+			mName = s.modelName
+		}
+		if mName != "" {
+			fmt.Fprintf(&buf, "vllm_router_running_requests{model=%q,worker=%q} %d\n", mName, u, wb.RunningRequests)
+		} else {
+			fmt.Fprintf(&buf, "vllm_router_running_requests{worker=%q} %d\n", u, wb.RunningRequests)
+		}
+	}
+	buf.WriteString("\n")
+
+	buf.WriteString("# HELP vllm_router_cb_outcomes_total Circuit breaker invocation outcomes per worker\n")
+	buf.WriteString("# TYPE vllm_router_cb_outcomes_total counter\n")
+	for u, wb := range workers {
+		mName := workerToModel[u]
+		if mName == "" && s.modelName != "" {
+			mName = s.modelName
+		}
+		if mName != "" {
+			fmt.Fprintf(&buf, "vllm_router_cb_outcomes_total{model=%q,outcome=\"success\",worker=%q} %d\n", mName, u, wb.TotalSuccesses)
+			fmt.Fprintf(&buf, "vllm_router_cb_outcomes_total{model=%q,outcome=\"failure\",worker=%q} %d\n", mName, u, wb.TotalFailures)
+		} else {
+			fmt.Fprintf(&buf, "vllm_router_cb_outcomes_total{outcome=\"success\",worker=%q} %d\n", u, wb.TotalSuccesses)
+			fmt.Fprintf(&buf, "vllm_router_cb_outcomes_total{outcome=\"failure\",worker=%q} %d\n", u, wb.TotalFailures)
+		}
+	}
+	buf.WriteString("\n")
+
+	// 2. Legacy gpu_router_* metrics for backward compatibility
 	buf.WriteString("# HELP gpu_router_models_total Total number of registered active models\n")
 	buf.WriteString("# TYPE gpu_router_models_total gauge\n")
 	fmt.Fprintf(&buf, "gpu_router_models_total %d\n\n", modelCount)
@@ -745,6 +830,19 @@ func (s *Supervisor) handleProxy(w http.ResponseWriter, req *http.Request) {
 		}
 		chosenURL := healthyURLs[idx]
 
+		s.workerMu.Lock()
+		if wb, ok := s.workerStates[chosenURL]; ok {
+			atomic.AddInt64(&wb.RunningRequests, 1)
+		}
+		s.workerMu.Unlock()
+		defer func() {
+			s.workerMu.Lock()
+			if wb, ok := s.workerStates[chosenURL]; ok {
+				atomic.AddInt64(&wb.RunningRequests, -1)
+			}
+			s.workerMu.Unlock()
+		}()
+
 		s.endpointsMu.RLock()
 		epMeta, hasMeta := s.endpointsMeta[chosenURL]
 		s.endpointsMu.RUnlock()
@@ -778,7 +876,24 @@ func (s *Supervisor) handleProxy(w http.ResponseWriter, req *http.Request) {
 				}
 			},
 			FlushInterval: 10 * time.Millisecond,
+			ModifyResponse: func(resp *http.Response) error {
+				s.workerMu.Lock()
+				if wb, ok := s.workerStates[chosenURL]; ok {
+					if resp.StatusCode < 500 {
+						atomic.AddInt64(&wb.TotalSuccesses, 1)
+					} else {
+						atomic.AddInt64(&wb.TotalFailures, 1)
+					}
+				}
+				s.workerMu.Unlock()
+				return nil
+			},
 			ErrorHandler: func(rw http.ResponseWriter, r *http.Request, err error) {
+				s.workerMu.Lock()
+				if wb, ok := s.workerStates[chosenURL]; ok {
+					atomic.AddInt64(&wb.TotalFailures, 1)
+				}
+				s.workerMu.Unlock()
 				if errors.Is(err, context.Canceled) || errors.Is(r.Context().Err(), context.Canceled) {
 					log.Printf("[Supervisor:DirectProxy] Client canceled/disconnected request for model %s (Queue timeout or User abort)", runner.ModelName)
 					return
@@ -804,6 +919,23 @@ func (s *Supervisor) handleProxy(w http.ResponseWriter, req *http.Request) {
 	defer atomic.AddInt64(&s.totalActiveConns, -1)
 	atomic.AddInt64(&runner.activeConns, 1)
 	defer atomic.AddInt64(&runner.activeConns, -1)
+
+	var singleWorker string
+	if len(activeURLs) == 1 {
+		singleWorker = activeURLs[0]
+		s.workerMu.Lock()
+		if wb, ok := s.workerStates[singleWorker]; ok {
+			atomic.AddInt64(&wb.RunningRequests, 1)
+		}
+		s.workerMu.Unlock()
+		defer func() {
+			s.workerMu.Lock()
+			if wb, ok := s.workerStates[singleWorker]; ok {
+				atomic.AddInt64(&wb.RunningRequests, -1)
+			}
+			s.workerMu.Unlock()
+		}()
+	}
 
 	var workerDescs []string
 	s.endpointsMu.RLock()
@@ -841,6 +973,9 @@ func (s *Supervisor) handleProxy(w http.ResponseWriter, req *http.Request) {
 			if workerURL == "" {
 				workerURL = resp.Header.Get("X-Vllm-Router-Worker")
 			}
+			if workerURL == "" && singleWorker != "" {
+				workerURL = singleWorker
+			}
 			if workerURL != "" {
 				s.endpointsMu.RLock()
 				meta, ok := s.endpointsMeta[workerURL]
@@ -851,10 +986,27 @@ func (s *Supervisor) handleProxy(w http.ResponseWriter, req *http.Request) {
 				}
 				log.Printf("[Supervisor:Route] 🎯 [Model: %s] [Policy: %s] Real Worker: %s%s (Status: %d)",
 					runner.ModelName, runner.Policy, workerURL, instDesc, resp.StatusCode)
+
+				s.workerMu.Lock()
+				if wb, ok := s.workerStates[workerURL]; ok {
+					if resp.StatusCode < 500 {
+						atomic.AddInt64(&wb.TotalSuccesses, 1)
+					} else {
+						atomic.AddInt64(&wb.TotalFailures, 1)
+					}
+				}
+				s.workerMu.Unlock()
 			}
 			return nil
 		},
 		ErrorHandler: func(rw http.ResponseWriter, r *http.Request, err error) {
+			if singleWorker != "" {
+				s.workerMu.Lock()
+				if wb, ok := s.workerStates[singleWorker]; ok {
+					atomic.AddInt64(&wb.TotalFailures, 1)
+				}
+				s.workerMu.Unlock()
+			}
 			if errors.Is(err, context.Canceled) || errors.Is(r.Context().Err(), context.Canceled) {
 				log.Printf("[Supervisor:Proxy] Client canceled/disconnected request for model %s (Queue timeout or User abort)", runner.ModelName)
 				return
@@ -912,6 +1064,15 @@ func (s *Supervisor) buildModelConfig(modelName string, host string, port int, w
 
 	if cfg.Policy == PolicyCacheAware && cfg.LogLevel == "" {
 		cfg.LogLevel = "debug"
+	}
+
+	if cfg.PrometheusHost == "" {
+		cfg.PrometheusHost = "127.0.0.1"
+	}
+	if cfg.PrometheusPort == 0 {
+		if pPort, err := getFreePort(); err == nil {
+			cfg.PrometheusPort = pPort
+		}
 	}
 
 	if cfg.LogDir != "" {
@@ -1531,6 +1692,12 @@ func (s *Supervisor) Stop() {
 	close(s.stopCh)
 	s.mu.Lock()
 	defer s.mu.Unlock()
+
+	if s.metricsServer != nil {
+		ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
+		defer cancel()
+		_ = s.metricsServer.Shutdown(ctx)
+	}
 
 	if s.frontServer != nil {
 		ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
