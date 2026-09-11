@@ -8,6 +8,7 @@ import (
 	"path/filepath"
 	"strconv"
 	"strings"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -348,6 +349,57 @@ func TestSupervisorConfigManager(t *testing.T) {
 	}
 	if len(loaded.Models) != 1 || loaded.Models[0].Mode != "proxy" {
 		t.Errorf("saved config model rule mismatch: got %+v", loaded.Models)
+	}
+}
+
+func TestSupervisor_ClientContextCanceledDoesNotTriggerProbe(t *testing.T) {
+	var probeCalled int32
+
+	sup := &Supervisor{
+		modelName: "test-model",
+		runners:   make(map[string]*ModelRunner),
+		probeWorkerFunc: func(ctx context.Context, rawURL string) (bool, error) {
+			atomic.AddInt32(&probeCalled, 1)
+			return true, nil
+		},
+		workerStates: make(map[string]*WorkerBreaker),
+	}
+
+	// Backend server that blocks until client cancels
+	backend := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		<-r.Context().Done()
+	}))
+	defer backend.Close()
+
+	targetURL, _ := url.Parse(backend.URL)
+	runner := &ModelRunner{
+		ModelName:    "test-model",
+		Mode:         "run",
+		ActiveTarget: targetURL,
+		ActiveURLs:   []string{backend.URL},
+		AllURLs:      []string{backend.URL},
+	}
+	sup.runners["test-model"] = runner
+
+	// Create request with cancelable context
+	ctx, cancel := context.WithCancel(context.Background())
+	req := httptest.NewRequest(http.MethodPost, "http://localhost:8000/v1/chat/completions", strings.NewReader(`{"model":"test-model"}`))
+	req = req.WithContext(ctx)
+
+	// Cancel context immediately to simulate client aborting during queueing
+	cancel()
+
+	rr := httptest.NewRecorder()
+	sup.handleProxy(rr, req)
+
+	// Give any background fastProbeRunner a moment if it were mistakenly spawned
+	time.Sleep(100 * time.Millisecond)
+
+	if calls := atomic.LoadInt32(&probeCalled); calls > 0 {
+		t.Errorf("expected 0 probe calls when client cancels, got %d", calls)
+	}
+	if rr.Code == http.StatusBadGateway {
+		t.Errorf("expected no 502 Bad Gateway written for client-side cancellation, got status %d", rr.Code)
 	}
 }
 

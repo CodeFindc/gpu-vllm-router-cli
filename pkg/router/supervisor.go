@@ -5,6 +5,7 @@ import (
 	"bytes"
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"log"
@@ -731,6 +732,10 @@ func (s *Supervisor) handleProxy(w http.ResponseWriter, req *http.Request) {
 			},
 			FlushInterval: 10 * time.Millisecond,
 			ErrorHandler: func(rw http.ResponseWriter, r *http.Request, err error) {
+				if errors.Is(err, context.Canceled) || errors.Is(r.Context().Err(), context.Canceled) {
+					log.Printf("[Supervisor:DirectProxy] Client canceled/disconnected request for model %s (Queue timeout or User abort)", runner.ModelName)
+					return
+				}
 				log.Printf("[Supervisor:DirectProxy] Forwarding error for model %s to %s: %v", runner.ModelName, chosenURL, err)
 				rw.WriteHeader(http.StatusBadGateway)
 				_, _ = rw.Write([]byte(fmt.Sprintf(`{"error":{"message":"Router direct proxy error for model %s: %v","type":"bad_gateway"}}`, runner.ModelName, err)))
@@ -764,6 +769,10 @@ func (s *Supervisor) handleProxy(w http.ResponseWriter, req *http.Request) {
 		},
 		FlushInterval: 10 * time.Millisecond,
 		ErrorHandler: func(rw http.ResponseWriter, r *http.Request, err error) {
+			if errors.Is(err, context.Canceled) || errors.Is(r.Context().Err(), context.Canceled) {
+				log.Printf("[Supervisor:Proxy] Client canceled/disconnected request for model %s (Queue timeout or User abort)", runner.ModelName)
+				return
+			}
 			log.Printf("[Supervisor:Proxy] Forwarding error for model %s: %v", runner.ModelName, err)
 			go s.fastProbeRunner(runner)
 			rw.WriteHeader(http.StatusBadGateway)

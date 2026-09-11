@@ -336,3 +336,48 @@ func TestProxy_WorkerPortChangeDynamicReload(t *testing.T) {
 	}
 }
 
+func TestProxy_ClientContextCanceledDoesNotTripBreaker(t *testing.T) {
+	backend := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		<-r.Context().Done()
+	}))
+	defer backend.Close()
+
+	srv := NewServer(ServerConfig{
+		Policy:    router.PolicyRoundRobin,
+		ModelName: "test-model",
+	}, nil)
+
+	endpoint := gpustack.WorkerEndpoint{
+		ModelName:  "test-model",
+		WorkerName: "worker-1",
+		URL:        backend.URL,
+	}
+	srv.updateSingleModelEndpoints("test-model", []gpustack.WorkerEndpoint{endpoint})
+
+	srv.mu.RLock()
+	pool := srv.modelPools["test-model"]
+	target := pool.Targets[0]
+	cb := target.CircuitBreaker
+	srv.mu.RUnlock()
+
+	// Simulate multiple client cancellations (e.g. user aborts in queue)
+	for i := 0; i < 5; i++ {
+		ctx, cancel := context.WithCancel(context.Background())
+		req := httptest.NewRequest(http.MethodPost, "http://localhost:8000/v1/chat/completions", strings.NewReader(`{"model":"test-model"}`))
+		req = req.WithContext(ctx)
+		cancel() // Cancel before completion
+
+		rr := httptest.NewRecorder()
+		srv.reverseProxy.ServeHTTP(rr, req)
+	}
+
+	state, fails, _ := cb.GetStatus()
+	if state != StateClosed {
+		t.Errorf("expected circuit breaker to remain CLOSED on client cancellations, got %v", state)
+	}
+	if fails != 0 {
+		t.Errorf("expected 0 failure count on client cancellations, got %d", fails)
+	}
+}
+
+

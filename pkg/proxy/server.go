@@ -103,6 +103,11 @@ func (t *retryTransport) RoundTrip(req *http.Request) (*http.Response, error) {
 			return resp, nil
 		}
 
+		// If client canceled or timed out, do not penalize the backend worker or retry
+		if errors.Is(err, context.Canceled) || errors.Is(ctx.Err(), context.Canceled) {
+			return resp, err
+		}
+
 		lastResp = resp
 		lastErr = err
 		if state.target.CircuitBreaker != nil {
@@ -372,6 +377,12 @@ func (s *Server) errorHandler(w http.ResponseWriter, req *http.Request, err erro
 				"code":    "model_not_found",
 			},
 		})
+		return
+	}
+
+	// If client canceled/aborted or timed out while waiting in queue, do not write 502
+	if errors.Is(err, context.Canceled) || errors.Is(ctx.Err(), context.Canceled) {
+		log.Printf("[Proxy] Client canceled/disconnected request for %s (Queue timeout or User abort)", req.URL.String())
 		return
 	}
 
