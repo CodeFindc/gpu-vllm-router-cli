@@ -280,3 +280,106 @@ func TestSupervisorProcessGuardCrashRespawn(t *testing.T) {
 		t.Errorf("expected runner CurrentProc to be updated to new process, but still old process")
 	}
 }
+
+func TestSupervisor_WorkerPortChangeDynamicReload(t *testing.T) {
+	oldWorker := "http://10.0.0.1:8000"
+	newWorker := "http://10.0.0.1:8001"
+
+	var spawnCount int
+	var lastSpawnedURLs []string
+	var spawnMu sync.Mutex
+
+	spawnFunc := func(ctx context.Context, host string, port int, workerURLs []string) (*runningProcess, error) {
+		spawnMu.Lock()
+		spawnCount++
+		lastSpawnedURLs = append([]string{}, workerURLs...)
+		spawnMu.Unlock()
+
+		targetURL, _ := url.Parse(fmt.Sprintf("http://127.0.0.1:%d", port))
+		return &runningProcess{
+			port:      port,
+			targetURL: targetURL,
+		}, nil
+	}
+
+	sup := &Supervisor{
+		modelName: "test-model",
+		cfg: SupervisorConfig{
+			WorkerMaxFailures:   2,
+			WorkerProbeInterval: 50 * time.Millisecond,
+			HealthCheckTimeout:  50 * time.Millisecond,
+			DrainTimeout:        50 * time.Millisecond,
+		},
+		runners:          make(map[string]*ModelRunner),
+		workerStates:     make(map[string]*WorkerBreaker),
+		stopCh:           make(chan struct{}),
+		spawnProcessFunc:  spawnFunc,
+		waitForHealthFunc: func(ctx context.Context, port int, timeout time.Duration) error { return nil },
+	}
+
+	initialURLs := []string{oldWorker}
+	initialTarget, _ := url.Parse("http://127.0.0.1:18001")
+	runner := &ModelRunner{
+		ModelName:    "test-model",
+		ActiveTarget: initialTarget,
+		ActiveURLs:   initialURLs,
+		AllURLs:      initialURLs,
+		CurrentProc: &runningProcess{
+			port:      18001,
+			targetURL: initialTarget,
+		},
+	}
+	sup.runners["test-model"] = runner
+	sup.syncWorkers(initialURLs)
+
+	// Verify old worker is tracked
+	sup.workerMu.RLock()
+	if _, exists := sup.workerStates[oldWorker]; !exists {
+		t.Fatalf("expected oldWorker to be in workerStates")
+	}
+	sup.workerMu.RUnlock()
+
+	// Simulate worker restart with port change: oldWorker is down, newWorker is up
+	// GPUStack discovery finds newWorker
+	newURLs := []string{newWorker}
+	runner.mu.Lock()
+	runner.AllURLs = newURLs
+	runner.mu.Unlock()
+
+	// syncWorkers should register newWorker and PRUNE oldWorker
+	sup.syncWorkers(newURLs)
+
+	sup.workerMu.RLock()
+	if _, exists := sup.workerStates[oldWorker]; exists {
+		t.Errorf("expected oldWorker %s to be pruned from workerStates after port change", oldWorker)
+	}
+	wbNew, exists := sup.workerStates[newWorker]
+	if !exists || !wbNew.Healthy {
+		t.Errorf("expected newWorker %s to be registered and healthy in workerStates", newWorker)
+	}
+	sup.workerMu.RUnlock()
+
+	// Execute rolling reload to newWorker
+	ctx := context.Background()
+	sup.performZeroDowntimeReloadForRunner(ctx, runner, newURLs)
+
+	spawnMu.Lock()
+	count := spawnCount
+	spawnedURLs := lastSpawnedURLs
+	spawnMu.Unlock()
+
+	if count != 1 {
+		t.Fatalf("expected 1 candidate spawned for rolling reload, got %d", count)
+	}
+	if !reflect.DeepEqual(spawnedURLs, []string{newWorker}) {
+		t.Errorf("expected candidate spawned with newWorker %v, got %v", []string{newWorker}, spawnedURLs)
+	}
+
+	runner.mu.RLock()
+	activeURLs := runner.ActiveURLs
+	runner.mu.RUnlock()
+
+	if !reflect.DeepEqual(activeURLs, []string{newWorker}) {
+		t.Errorf("expected runner ActiveURLs updated to %v, got %v", []string{newWorker}, activeURLs)
+	}
+}

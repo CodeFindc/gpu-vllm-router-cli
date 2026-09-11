@@ -157,6 +157,34 @@ func (s *Supervisor) initWorkers(urls []string) {
 	}
 }
 
+// syncWorkers ensures all activeURLs are tracked in workerStates and prunes obsolete/dead URLs.
+func (s *Supervisor) syncWorkers(activeURLs []string) {
+	if len(activeURLs) == 0 {
+		return
+	}
+	s.workerMu.Lock()
+	defer s.workerMu.Unlock()
+
+	activeSet := make(map[string]bool, len(activeURLs))
+	for _, u := range activeURLs {
+		activeSet[u] = true
+		if _, exists := s.workerStates[u]; !exists {
+			s.workerStates[u] = &WorkerBreaker{
+				URL:       u,
+				Healthy:   true,
+				LastProbe: time.Now(),
+			}
+		}
+	}
+
+	for u := range s.workerStates {
+		if !activeSet[u] {
+			log.Printf("[Supervisor] Pruning obsolete worker state: %s", u)
+			delete(s.workerStates, u)
+		}
+	}
+}
+
 // GetFreePort finds an available unprivileged TCP port on 127.0.0.1.
 func GetFreePort() (int, error) {
 	return getFreePort()
@@ -276,7 +304,7 @@ func (s *Supervisor) Start(ctx context.Context) error {
 					return fmt.Errorf("failed to start router for model %s: %w", model.Name, err)
 				}
 				runner.AllURLs = urls
-				s.initWorkers(urls)
+				s.syncWorkers(urls)
 
 				s.mu.Lock()
 				s.runners[model.Name] = runner
@@ -296,10 +324,12 @@ func (s *Supervisor) Start(ctx context.Context) error {
 				log.Printf("[Supervisor] [Multi-Model Router Pool] Discovered %d model(s) and %d running instance(s) in cluster:",
 					cluster.ModelCount, cluster.InstanceCount)
 
+				var allClusterURLs []string
 				for mName, eps := range cluster.ModelsEndpoints {
 					var urls []string
 					for _, ep := range eps {
 						urls = append(urls, ep.URL)
+						allClusterURLs = append(allClusterURLs, ep.URL)
 					}
 					sort.Strings(urls)
 					log.Printf("[Supervisor] Initializing vllm-router process for model %q with %d worker(s)...", mName, len(urls))
@@ -310,7 +340,6 @@ func (s *Supervisor) Start(ctx context.Context) error {
 						continue
 					}
 					runner.AllURLs = urls
-					s.initWorkers(urls)
 
 					s.mu.Lock()
 					s.runners[mName] = runner
@@ -321,6 +350,7 @@ func (s *Supervisor) Start(ctx context.Context) error {
 					}
 					s.mu.Unlock()
 				}
+				s.syncWorkers(allClusterURLs)
 			}
 		}
 	} else {
@@ -1111,7 +1141,7 @@ func (s *Supervisor) watchLoop(ctx context.Context) {
 					runner.mu.Lock()
 					runner.AllURLs = newURLs
 					runner.mu.Unlock()
-					s.initWorkers(newURLs)
+					s.syncWorkers(newURLs)
 
 					// Compute healthy subset among newURLs
 					s.workerMu.RLock()
@@ -1150,14 +1180,22 @@ func (s *Supervisor) watchLoop(ctx context.Context) {
 					continue
 				}
 
-				// 1. Check existing and new models
+				// 1. Sync all active cluster worker states and prune obsolete endpoints
+				var allClusterURLs []string
+				for _, eps := range cluster.ModelsEndpoints {
+					for _, ep := range eps {
+						allClusterURLs = append(allClusterURLs, ep.URL)
+					}
+				}
+				s.syncWorkers(allClusterURLs)
+
+				// 2. Check existing and new models
 				for mName, eps := range cluster.ModelsEndpoints {
 					var newURLs []string
 					for _, ep := range eps {
 						newURLs = append(newURLs, ep.URL)
 					}
 					sort.Strings(newURLs)
-					s.initWorkers(newURLs)
 
 					s.mu.RLock()
 					runner, exists := s.runners[mName]

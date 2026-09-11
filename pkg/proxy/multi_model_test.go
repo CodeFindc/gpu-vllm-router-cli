@@ -272,3 +272,67 @@ func TestProxyConfigManager(t *testing.T) {
 	}
 }
 
+func TestProxy_WorkerPortChangeDynamicReload(t *testing.T) {
+	srv := NewServer(ServerConfig{
+		Policy:    router.PolicyRoundRobin,
+		ModelName: "test-model",
+	}, nil)
+
+	oldEndpoint := gpustack.WorkerEndpoint{
+		ModelName:  "test-model",
+		WorkerName: "worker-node-1",
+		URL:        "http://10.0.0.1:8000",
+	}
+
+	// 1. Initial configuration with old worker on port 8000
+	srv.updateSingleModelEndpoints("test-model", []gpustack.WorkerEndpoint{oldEndpoint})
+
+	srv.mu.RLock()
+	pool := srv.modelPools["test-model"]
+	if pool == nil || len(pool.Targets) != 1 || pool.Targets[0].URLString != "http://10.0.0.1:8000" {
+		t.Fatalf("expected initial target http://10.0.0.1:8000, got: %+v", pool)
+	}
+	oldCB := pool.Targets[0].CircuitBreaker
+	srv.mu.RUnlock()
+
+	// 2. Simulate Circuit Breaker trip on port 8000 (e.g. OOM or crash)
+	for i := 0; i < 5; i++ {
+		oldCB.RecordFailure(context.DeadlineExceeded)
+	}
+	state, _, _ := oldCB.GetStatus()
+	if state != StateOpen {
+		t.Fatalf("expected old target circuit breaker OPEN, got %v", state)
+	}
+
+	// 3. Worker restarts on new port 8001; GPUStack returns new endpoint
+	newEndpoint := gpustack.WorkerEndpoint{
+		ModelName:  "test-model",
+		WorkerName: "worker-node-1",
+		URL:        "http://10.0.0.1:8001",
+	}
+	srv.updateSingleModelEndpoints("test-model", []gpustack.WorkerEndpoint{newEndpoint})
+
+	// 4. Verify that port 8000 is pruned and port 8001 is active with fresh healthy breaker
+	srv.mu.RLock()
+	defer srv.mu.RUnlock()
+
+	pool = srv.modelPools["test-model"]
+	if len(pool.Targets) != 1 {
+		t.Fatalf("expected 1 target after reload, got %d", len(pool.Targets))
+	}
+	newTarget := pool.Targets[0]
+	if newTarget.URLString != "http://10.0.0.1:8001" {
+		t.Errorf("expected target URL http://10.0.0.1:8001, got %s", newTarget.URLString)
+	}
+	newState, _, _ := newTarget.CircuitBreaker.GetStatus()
+	if newState != StateClosed {
+		t.Errorf("expected new target circuit breaker CLOSED (healthy), got %v", newState)
+	}
+	if len(srv.activeURLs) != 1 || srv.activeURLs[0] != "http://10.0.0.1:8001" {
+		t.Errorf("expected activeURLs updated to 8001, got: %v", srv.activeURLs)
+	}
+	if len(srv.allTargets) != 1 || srv.allTargets[0].URLString != "http://10.0.0.1:8001" {
+		t.Errorf("expected allTargets updated to 8001, got: %+v", srv.allTargets)
+	}
+}
+
