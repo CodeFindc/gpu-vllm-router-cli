@@ -274,6 +274,9 @@ func inspectModelFromRequest(req *http.Request) (string, []byte) {
 		bodyBytes, err := io.ReadAll(req.Body)
 		if err == nil {
 			req.Body = io.NopCloser(bytes.NewReader(bodyBytes))
+			req.GetBody = func() (io.ReadCloser, error) {
+				return io.NopCloser(bytes.NewReader(bodyBytes)), nil
+			}
 
 			var peek struct {
 				Model string `json:"model"`
@@ -1758,6 +1761,10 @@ func (s *Supervisor) Stop() {
 	close(s.stopCh)
 	s.mu.Lock()
 	defer s.mu.Unlock()
+
+	if s.transport != nil {
+		s.transport.CloseIdleConnections()
+	}
 
 	if s.metricsServer != nil {
 		ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)

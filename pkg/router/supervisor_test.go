@@ -1,7 +1,9 @@
 package router
 
 import (
+	"bytes"
 	"context"
+	"io"
 	"net/http"
 	"net/http/httptest"
 	"net/url"
@@ -451,6 +453,107 @@ func TestSupervisor_ModelLogDirIsolation(t *testing.T) {
 	if fi, err := os.Stat(cfgEmpty.LogDir); err != nil || !fi.IsDir() {
 		t.Errorf("expected base log dir %q to exist on disk: %v", cfgEmpty.LogDir, err)
 	}
+}
+
+func TestSupervisor_TransportKeepAliveAcrossReload(t *testing.T) {
+	// 1. Verify inspectModelFromRequest sets req.GetBody for replayability
+	bodyContent := `{"model":"deepseek-v3","messages":[{"role":"user","content":"hello"}]}`
+	req, err := http.NewRequest(http.MethodPost, "/v1/chat/completions", bytes.NewReader([]byte(bodyContent)))
+	if err != nil {
+		t.Fatalf("failed to create request: %v", err)
+	}
+	mName, bodyBytes := inspectModelFromRequest(req)
+	if mName != "deepseek-v3" {
+		t.Fatalf("expected model deepseek-v3, got %s", mName)
+	}
+	if req.GetBody == nil {
+		t.Fatalf("expected req.GetBody to be set for transparent HTTP keep-alive retry")
+	}
+	rc, err := req.GetBody()
+	if err != nil {
+		t.Fatalf("req.GetBody() error: %v", err)
+	}
+	replayBytes, _ := io.ReadAll(rc)
+	_ = rc.Close()
+	if string(replayBytes) != string(bodyBytes) {
+		t.Fatalf("req.GetBody content mismatch: expected %q, got %q", string(bodyBytes), string(replayBytes))
+	}
+
+	// 2. End-to-end Keep-Alive and Reload test
+	var target1Hits, target2Hits int64
+	backend1 := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		atomic.AddInt64(&target1Hits, 1)
+		w.Header().Set("X-Backend", "target1")
+		w.WriteHeader(http.StatusOK)
+		_, _ = w.Write([]byte(`{"reply":"from target 1"}`))
+	}))
+
+	u1, _ := url.Parse(backend1.URL)
+	sup := NewSupervisor(nil, "deepseek-v3", SupervisorConfig{PublicPort: 18999})
+	sup.transport = NewOptimizedTransport()
+	sup.runners["deepseek-v3"] = &ModelRunner{
+		ModelName:    "deepseek-v3",
+		Mode:         "run",
+		ActiveTarget: u1,
+		ActiveURLs:   []string{backend1.URL},
+	}
+
+	// Round 1: Send requests to target 1 with persistent keep-alive
+	proxyServer := httptest.NewServer(http.HandlerFunc(sup.handleProxy))
+	defer proxyServer.Close()
+
+	client := proxyServer.Client() // uses keep-alive
+	for i := 0; i < 5; i++ {
+		pReq, _ := http.NewRequest(http.MethodPost, proxyServer.URL+"/v1/chat/completions", bytes.NewReader([]byte(bodyContent)))
+		resp, err := client.Do(pReq)
+		if err != nil {
+			t.Fatalf("round 1 request %d failed: %v", i, err)
+		}
+		_ = resp.Body.Close()
+		if resp.Header.Get("X-Backend") != "target1" {
+			t.Fatalf("expected response from target1, got %s", resp.Header.Get("X-Backend"))
+		}
+	}
+	if atomic.LoadInt64(&target1Hits) != 5 {
+		t.Fatalf("expected 5 hits to target1, got %d", target1Hits)
+	}
+
+	// Round 2: Blue-green dynamic target migration to target 2
+	backend2 := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		atomic.AddInt64(&target2Hits, 1)
+		w.Header().Set("X-Backend", "target2")
+		w.WriteHeader(http.StatusOK)
+		_, _ = w.Write([]byte(`{"reply":"from target 2"}`))
+	}))
+	defer backend2.Close()
+
+	u2, _ := url.Parse(backend2.URL)
+	sup.runners["deepseek-v3"].mu.Lock()
+	sup.runners["deepseek-v3"].ActiveTarget = u2
+	sup.runners["deepseek-v3"].ActiveURLs = []string{backend2.URL}
+	sup.runners["deepseek-v3"].mu.Unlock()
+
+	// Simulate old backend1 shutdown
+	backend1.Close()
+
+	// Send requests after migration: must seamlessly reuse connection pool to target 2 without EOF/BrokenPipe
+	for i := 0; i < 5; i++ {
+		pReq, _ := http.NewRequest(http.MethodPost, proxyServer.URL+"/v1/chat/completions", bytes.NewReader([]byte(bodyContent)))
+		resp, err := client.Do(pReq)
+		if err != nil {
+			t.Fatalf("round 2 request %d failed after migration: %v", i, err)
+		}
+		_ = resp.Body.Close()
+		if resp.Header.Get("X-Backend") != "target2" {
+			t.Fatalf("expected response from target2, got %s", resp.Header.Get("X-Backend"))
+		}
+	}
+	if atomic.LoadInt64(&target2Hits) != 5 {
+		t.Fatalf("expected 5 hits to target2, got %d", target2Hits)
+	}
+
+	// 3. Verify clean shutdown and CloseIdleConnections
+	sup.Stop()
 }
 
 
