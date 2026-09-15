@@ -82,12 +82,25 @@ func NewCircuitBreaker(targetURL string, cfg CircuitBreakerConfig) *CircuitBreak
 		lastStateChange: time.Now(),
 		httpClient: &http.Client{
 			Timeout: 2 * time.Second,
+			Transport: &http.Transport{
+				MaxIdleConns:        100,
+				MaxIdleConnsPerHost: 10,
+				IdleConnTimeout:     30 * time.Second,
+			},
 		},
 	}
 }
 
 // CanExecute returns true if requests should be allowed through to the target.
 func (cb *CircuitBreaker) CanExecute() bool {
+	// Fast path: RLock read for healthy StateClosed (avoids write lock contention under high concurrency)
+	cb.mu.RLock()
+	if cb.state == StateClosed {
+		cb.mu.RUnlock()
+		return true
+	}
+	cb.mu.RUnlock()
+
 	cb.mu.Lock()
 	defer cb.mu.Unlock()
 

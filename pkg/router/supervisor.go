@@ -109,10 +109,31 @@ type Supervisor struct {
 	frontServer   *http.Server
 	metricsServer *http.Server
 	stopCh        chan struct{}
+	transport     *http.Transport
 
 	spawnProcessFunc  func(ctx context.Context, host string, port int, workerURLs []string) (*runningProcess, error)
 	probeWorkerFunc   func(ctx context.Context, rawURL string) (bool, error)
 	waitForHealthFunc func(ctx context.Context, port int, timeout time.Duration) error
+}
+
+// getTransport returns the configured connection pool transport, safely initializing if needed.
+func (s *Supervisor) getTransport() *http.Transport {
+	if s == nil {
+		return NewOptimizedTransport()
+	}
+	s.mu.RLock()
+	t := s.transport
+	s.mu.RUnlock()
+	if t != nil {
+		return t
+	}
+
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if s.transport == nil {
+		s.transport = NewOptimizedTransport()
+	}
+	return s.transport
 }
 
 // NewSupervisor creates a new Supervisor instance.
@@ -158,6 +179,7 @@ func NewSupervisor(client *gpustack.Client, modelName string, cfg SupervisorConf
 		stopCh:         make(chan struct{}),
 		configFilePath: cfg.ConfigFilePath,
 		modelRules:     rulesMap,
+		transport:      NewOptimizedTransport(),
 	}
 }
 
@@ -852,7 +874,7 @@ func (s *Supervisor) handleProxy(w http.ResponseWriter, req *http.Request) {
 		if hasMeta && epMeta.WorkerName != "" {
 			instDesc = fmt.Sprintf(" (Worker: %s, Instance: %s)", epMeta.WorkerName, epMeta.InstanceName)
 		}
-		log.Printf("[Supervisor:Route] 🚀 [Model: %s] [DirectProxy] %s %s -> %s%s (ActiveConns: %d)",
+		logger.Debugf("[Supervisor:Route] 🚀 [Model: %s] [DirectProxy] %s %s -> %s%s (ActiveConns: %d)",
 			runner.ModelName, req.Method, req.URL.Path, chosenURL, instDesc, atomic.LoadInt64(&runner.activeConns))
 
 		destURL, parseErr := url.Parse(chosenURL)
@@ -869,6 +891,7 @@ func (s *Supervisor) handleProxy(w http.ResponseWriter, req *http.Request) {
 		defer atomic.AddInt64(&runner.activeConns, -1)
 
 		proxy := &httputil.ReverseProxy{
+			Transport: s.getTransport(),
 			Director: func(r *http.Request) {
 				r.URL.Scheme = destURL.Scheme
 				r.URL.Host = destURL.Host
@@ -954,12 +977,13 @@ func (s *Supervisor) handleProxy(w http.ResponseWriter, req *http.Request) {
 	workersSummary := strings.Join(workerDescs, ", ")
 
 	proxy := &httputil.ReverseProxy{
+		Transport: s.getTransport(),
 		Director: func(r *http.Request) {
 			if len(activeURLs) == 1 {
-				log.Printf("[Supervisor:Route] 🚀 [Model: %s] [Policy: %s] %s %s -> Worker: %s (ActiveConns: %d)",
+				logger.Debugf("[Supervisor:Route] 🚀 [Model: %s] [Policy: %s] %s %s -> Worker: %s (ActiveConns: %d)",
 					runner.ModelName, runner.Policy, r.Method, r.URL.Path, workersSummary, atomic.LoadInt64(&runner.activeConns))
 			} else {
-				log.Printf("[Supervisor:Route] 🔀 [Model: %s] [Policy: %s] %s %s -> vllm-router (%s) | Workers: [%s] (ActiveConns: %d)",
+				logger.Debugf("[Supervisor:Route] 🔀 [Model: %s] [Policy: %s] %s %s -> vllm-router (%s) | Workers: [%s] (ActiveConns: %d)",
 					runner.ModelName, runner.Policy, r.Method, r.URL.Path, target.String(), workersSummary, atomic.LoadInt64(&runner.activeConns))
 			}
 			r.URL.Scheme = target.Scheme

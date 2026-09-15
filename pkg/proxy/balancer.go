@@ -1,12 +1,9 @@
 package proxy
 
 import (
-	"bytes"
 	"encoding/json"
 	"errors"
 	"hash/fnv"
-	"io"
-	"log"
 	"math/rand"
 	"net/http"
 	"net/url"
@@ -266,7 +263,7 @@ func (b *ConsistentHashBalancer) SelectTargetExcluding(r *http.Request, excluded
 			continue
 		}
 		if target.CircuitBreaker == nil || target.CircuitBreaker.CanExecute() {
-			log.Printf("[Balancer:ConsistentHash] 🎯 Routed to worker %s (Active: %d) | SessionKey: %q (hash=0x%08x)",
+			logger.Debugf("[Balancer:ConsistentHash] 🎯 Routed to worker %s (Active: %d) | SessionKey: %q (hash=0x%08x)",
 				target.URLString, atomic.LoadInt64(&target.ActiveConns), key, h)
 			return target, nil
 		}
@@ -302,11 +299,8 @@ func extractSessionKey(r *http.Request) string {
 
 	// Priority 5: If JSON body is present, attempt to extract user or session_params
 	if r.Body != nil && (r.Method == http.MethodPost || r.Method == http.MethodPut) {
-		bodyBytes, err := io.ReadAll(r.Body)
-		if err == nil {
-			// Restore request body for downstream handler
-			r.Body = io.NopCloser(bytes.NewReader(bodyBytes))
-
+		bodyBytes := getOrReadRequestBody(r)
+		if len(bodyBytes) > 0 {
 			var reqMap map[string]interface{}
 			if err := json.Unmarshal(bodyBytes, &reqMap); err == nil {
 				if user, ok := reqMap["user"].(string); ok && user != "" {
@@ -442,14 +436,8 @@ func extractCacheAwareKeyInfo(r *http.Request) CacheAwareKeyInfo {
 
 	// Try to extract prompt prefix from JSON body if present
 	if r.Body != nil && (r.Method == http.MethodPost || r.Method == http.MethodPut) {
-		bodyBytes, err := io.ReadAll(r.Body)
-		if err == nil {
-			// Restore request body for downstream handlers
-			r.Body = io.NopCloser(bytes.NewReader(bodyBytes))
-			r.GetBody = func() (io.ReadCloser, error) {
-				return io.NopCloser(bytes.NewReader(bodyBytes)), nil
-			}
-
+		bodyBytes := getOrReadRequestBody(r)
+		if len(bodyBytes) > 0 {
 			var reqMap map[string]interface{}
 			if err := json.Unmarshal(bodyBytes, &reqMap); err == nil {
 				// 1. Check prompt string or prompt array

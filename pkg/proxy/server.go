@@ -22,6 +22,7 @@ import (
 	"gpu-vllm-router/pkg/config"
 	"gpu-vllm-router/pkg/dashboard"
 	"gpu-vllm-router/pkg/gpustack"
+	"gpu-vllm-router/pkg/logger"
 	"gpu-vllm-router/pkg/router"
 	"gpu-vllm-router/pkg/swagger"
 )
@@ -212,11 +213,41 @@ func NewServer(cfg ServerConfig, client *gpustack.Client) *Server {
 		ModifyResponse: s.modifyResponse,
 		ErrorHandler:   s.errorHandler,
 		FlushInterval:  10 * time.Millisecond, // Instant flush for LLM streaming SSE
-		Transport:      &retryTransport{server: s, base: http.DefaultTransport},
+		Transport:      &retryTransport{server: s, base: router.NewOptimizedTransport()},
 	}
 	s.reverseProxy = proxy
 
 	return s
+}
+
+type proxyContextKey string
+
+const (
+	cachedRequestBodyKey proxyContextKey = "cached_request_body"
+)
+
+// getOrReadRequestBody retrieves the cached request body from context, or reads it once from req.Body and caches it.
+func getOrReadRequestBody(r *http.Request) []byte {
+	if r == nil {
+		return nil
+	}
+	if cached, ok := r.Context().Value(cachedRequestBodyKey).([]byte); ok && cached != nil {
+		return cached
+	}
+	if r.Body == nil || (r.Method != http.MethodPost && r.Method != http.MethodPut) {
+		return nil
+	}
+	bodyBytes, err := io.ReadAll(r.Body)
+	if err != nil {
+		return nil
+	}
+	// Restore request body and set GetBody for transparent retries
+	r.Body = io.NopCloser(bytes.NewReader(bodyBytes))
+	r.GetBody = func() (io.ReadCloser, error) {
+		return io.NopCloser(bytes.NewReader(bodyBytes)), nil
+	}
+	*r = *r.WithContext(context.WithValue(r.Context(), cachedRequestBodyKey, bodyBytes))
+	return bodyBytes
 }
 
 // extractModelFromRequest inspects query param and JSON body to determine the requested model.
@@ -228,14 +259,8 @@ func extractModelFromRequest(req *http.Request) (string, []byte) {
 
 	// 2. Peek into JSON body for POST/PUT requests
 	if req.Body != nil && (req.Method == http.MethodPost || req.Method == http.MethodPut) {
-		bodyBytes, err := io.ReadAll(req.Body)
-		if err == nil {
-			// Restore request body and set GetBody for transparent retries
-			req.Body = io.NopCloser(bytes.NewReader(bodyBytes))
-			req.GetBody = func() (io.ReadCloser, error) {
-				return io.NopCloser(bytes.NewReader(bodyBytes)), nil
-			}
-
+		bodyBytes := getOrReadRequestBody(req)
+		if len(bodyBytes) > 0 {
 			var peek struct {
 				Model string `json:"model"`
 			}
@@ -329,10 +354,10 @@ func (s *Server) director(req *http.Request) {
 		s.endpointsMu.RUnlock()
 
 		if len(pool.Targets) == 1 && len(workerDescs) > 0 {
-			log.Printf("[Proxy:Route] 🚀 [Model: %s] [Policy: %s] %s %s -> Worker: %s (Mode: run)",
+			logger.Debugf("[Proxy:Route] 🚀 [Model: %s] [Policy: %s] %s %s -> Worker: %s (Mode: run)",
 				pool.ModelName, pool.Policy, req.Method, req.URL.Path, workerDescs[0])
 		} else {
-			log.Printf("[Proxy:Route] 🔀 [Model: %s] [Policy: %s] %s %s -> vllm-router (%s) | Workers: [%s]",
+			logger.Debugf("[Proxy:Route] 🔀 [Model: %s] [Policy: %s] %s %s -> vllm-router (%s) | Workers: [%s]",
 				pool.ModelName, pool.Policy, req.Method, req.URL.Path, pool.RunnerTarget.String(), strings.Join(workerDescs, ", "))
 		}
 
@@ -367,7 +392,7 @@ func (s *Server) director(req *http.Request) {
 		instDesc = fmt.Sprintf(" (Worker: %s, Instance: %s)", epMeta.WorkerName, epMeta.InstanceName)
 	}
 
-	log.Printf("[Proxy:Route] 🚀 [Model: %s] [Policy: %s] %s %s -> %s%s (ActiveConns: %d)",
+	logger.Debugf("[Proxy:Route] 🚀 [Model: %s] [Policy: %s] %s %s -> %s%s (ActiveConns: %d)",
 		pool.ModelName, pool.Policy, req.Method, req.URL.Path, target.URLString, instDesc, atomic.LoadInt64(&target.ActiveConns))
 
 	// Save routeState in context for retryTransport, modifyResponse, and errorHandler
