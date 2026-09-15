@@ -189,7 +189,7 @@ func (s *Supervisor) syncWorkers(activeURLs []string) {
 		if _, exists := s.workerStates[u]; !exists {
 			s.workerStates[u] = &WorkerBreaker{
 				URL:       u,
-				Healthy:   true,
+				Healthy:   false, // New workers are unverified until probed
 				LastProbe: time.Now(),
 			}
 		}
@@ -199,7 +199,7 @@ func (s *Supervisor) syncWorkers(activeURLs []string) {
 		if !activeSet[u] {
 			// Do not prune immediately if worker is currently unhealthy/tripped;
 			// retain it so the probe loop and auto-healer can inspect and heal it!
-			if wb != nil && !wb.Healthy {
+			if wb != nil && !wb.Healthy && !wb.OpenSince.IsZero() {
 				continue
 			}
 			log.Printf("[Supervisor] Pruning obsolete worker state: %s", u)
@@ -211,7 +211,7 @@ func (s *Supervisor) syncWorkers(activeURLs []string) {
 	for u := range s.endpointsMeta {
 		if !activeSet[u] {
 			// Retain metadata for unhealthy workers so their InstanceID is preserved for auto-healing
-			if wb := s.workerStates[u]; wb != nil && !wb.Healthy {
+			if wb := s.workerStates[u]; wb != nil && !wb.Healthy && !wb.OpenSince.IsZero() {
 				continue
 			}
 			delete(s.endpointsMeta, u)
@@ -348,6 +348,7 @@ func (s *Supervisor) Start(ctx context.Context) error {
 					return fmt.Errorf("failed to start router for model %s: %w", model.Name, err)
 				}
 				runner.AllURLs = urls
+				s.initWorkers(urls)
 				s.syncWorkers(urls)
 
 				s.mu.Lock()
@@ -395,6 +396,7 @@ func (s *Supervisor) Start(ctx context.Context) error {
 					}
 					s.mu.Unlock()
 				}
+				s.initWorkers(allClusterURLs)
 				s.syncWorkers(allClusterURLs)
 			}
 		}
@@ -1179,32 +1181,53 @@ func (s *Supervisor) handleProcessExit(proc *runningProcess, waitErr error) {
 }
 
 func (s *Supervisor) probeWorker(ctx context.Context, rawURL string) (bool, error) {
-	client := &http.Client{Timeout: 1500 * time.Millisecond}
+	client := &http.Client{Timeout: 2000 * time.Millisecond}
 
-	// 1. Try /health
-	healthURL := strings.TrimRight(rawURL, "/") + "/health"
-	req, err := http.NewRequestWithContext(ctx, http.MethodGet, healthURL, nil)
+	// 1. Proactive Readiness Probe via /v1/models (verifies model is loaded and ready for inference)
+	modelsURL := strings.TrimRight(rawURL, "/") + "/v1/models"
+	reqModels, err := http.NewRequestWithContext(ctx, http.MethodGet, modelsURL, nil)
 	if err == nil {
-		resp, err := client.Do(req)
+		resp, err := client.Do(reqModels)
 		if err == nil {
-			resp.Body.Close()
+			defer resp.Body.Close()
 			if resp.StatusCode == http.StatusOK {
+				var modelsResp struct {
+					Data []interface{} `json:"data"`
+				}
+				bodyBytes, readErr := io.ReadAll(io.LimitReader(resp.Body, 64*1024))
+				if readErr == nil && json.Unmarshal(bodyBytes, &modelsResp) == nil {
+					if bytes.Contains(bodyBytes, []byte(`"data"`)) {
+						if len(modelsResp.Data) > 0 {
+							return true, nil
+						}
+						return false, fmt.Errorf("model instance is still loading weights (model list is empty)")
+					}
+					return true, nil
+				}
+				// If JSON parse fails or data field is missing, assume 200 OK is healthy
 				return true, nil
 			}
+			if resp.StatusCode == http.StatusServiceUnavailable {
+				return false, fmt.Errorf("model instance is still loading (HTTP 503 Service Unavailable)")
+			}
+			if resp.StatusCode != http.StatusNotFound {
+				return false, fmt.Errorf("readiness probe /v1/models returned HTTP %d", resp.StatusCode)
+			}
+			// HTTP 404: not an OpenAI models endpoint (e.g. custom or mock backend), fallback to /health
 		}
 	}
 
-	// 2. Fallback /v1/models
-	modelsURL := strings.TrimRight(rawURL, "/") + "/v1/models"
-	req2, err := http.NewRequestWithContext(ctx, http.MethodGet, modelsURL, nil)
+	// 2. Fallback Liveness Probe via /health (for non-OpenAI or mock backends)
+	healthURL := strings.TrimRight(rawURL, "/") + "/health"
+	reqHealth, err := http.NewRequestWithContext(ctx, http.MethodGet, healthURL, nil)
 	if err == nil {
-		resp, err := client.Do(req2)
+		resp, err := client.Do(reqHealth)
 		if err == nil {
-			resp.Body.Close()
+			defer resp.Body.Close()
 			if resp.StatusCode == http.StatusOK {
 				return true, nil
 			}
-			return false, fmt.Errorf("HTTP status %d", resp.StatusCode)
+			return false, fmt.Errorf("liveness probe /health returned HTTP %d", resp.StatusCode)
 		}
 		return false, err
 	}
@@ -1338,7 +1361,7 @@ func (s *Supervisor) probeRunnerWorkers(ctx context.Context, runner *ModelRunner
 		} else {
 			log.Printf("[Supervisor:Breaker] ⚡ Healthy worker pool changed for model %q! (Active: %d -> Healthy: %d). Triggering immediate zero-downtime rolling reload...",
 				runner.ModelName, len(activeURLs), len(healthyURLs))
-			go s.performZeroDowntimeReloadForRunner(ctx, runner, healthyURLs)
+			go s.performZeroDowntimeReloadForRunner(context.Background(), runner, healthyURLs)
 		}
 	}
 }
@@ -1482,28 +1505,23 @@ func (s *Supervisor) watchLoop(ctx context.Context) {
 					var healthyNewURLs []string
 					for _, u := range newURLs {
 						wb, ok := s.workerStates[u]
-						if !ok || wb.Healthy {
+						if ok && wb.Healthy {
 							healthyNewURLs = append(healthyNewURLs, u)
 						}
 					}
 					s.workerMu.RUnlock()
 
-					if len(healthyNewURLs) == 0 {
-						healthyNewURLs = newURLs
-					}
 					sort.Strings(healthyNewURLs)
 
 					runner.mu.RLock()
 					currURLs := runner.ActiveURLs
 					runner.mu.RUnlock()
 
-					if !reflect.DeepEqual(currURLs, healthyNewURLs) {
+					if len(healthyNewURLs) > 0 && !reflect.DeepEqual(currURLs, healthyNewURLs) {
 						log.Printf("[Supervisor] [Watch] Detected topology change for model %s!", s.modelName)
 						log.Printf("  Previous URLs: %v", currURLs)
 						log.Printf("  New URLs:      %v", healthyNewURLs)
-						if len(healthyNewURLs) > 0 {
-							s.performZeroDowntimeReloadForRunner(ctx, runner, healthyNewURLs)
-						}
+						s.performZeroDowntimeReloadForRunner(context.Background(), runner, healthyNewURLs)
 					}
 				}
 			} else {
@@ -1556,28 +1574,23 @@ func (s *Supervisor) watchLoop(ctx context.Context) {
 						var healthyNewURLs []string
 						for _, u := range newURLs {
 							wb, ok := s.workerStates[u]
-							if !ok || wb.Healthy {
+							if ok && wb.Healthy {
 								healthyNewURLs = append(healthyNewURLs, u)
 							}
 						}
 						s.workerMu.RUnlock()
 
-						if len(healthyNewURLs) == 0 {
-							healthyNewURLs = newURLs
-						}
 						sort.Strings(healthyNewURLs)
 
 						runner.mu.RLock()
 						currURLs := runner.ActiveURLs
 						runner.mu.RUnlock()
 
-						if !reflect.DeepEqual(currURLs, healthyNewURLs) {
+						if len(healthyNewURLs) > 0 && !reflect.DeepEqual(currURLs, healthyNewURLs) {
 							log.Printf("[Supervisor] [Watch] Detected topology change for model %q!", mName)
 							log.Printf("  Previous URLs: %v", currURLs)
 							log.Printf("  New URLs:      %v", healthyNewURLs)
-							if len(healthyNewURLs) > 0 {
-								s.performZeroDowntimeReloadForRunner(ctx, runner, healthyNewURLs)
-							}
+							s.performZeroDowntimeReloadForRunner(context.Background(), runner, healthyNewURLs)
 						}
 					}
 				}
@@ -1638,17 +1651,37 @@ func (s *Supervisor) performZeroDowntimeReloadForRunner(ctx context.Context, run
 		return
 	}
 
+	// Ensure candidate process is spawned with supervisor lifetime, not short-lived caller context
+	spawnCtx, spawnCancel := context.WithCancel(context.Background())
+	go func() {
+		select {
+		case <-s.stopCh:
+			spawnCancel()
+		case <-spawnCtx.Done():
+		}
+	}()
+
 	log.Printf("[Supervisor] [Zero-Downtime Reload] [%s] Step 1/4: Launching candidate on internal port %d (New Workers: %d)...",
 		runner.ModelName, nextPort, len(newURLs))
-	newProc, err := s.doSpawnForModel(ctx, runner.ModelName, "127.0.0.1", nextPort, newURLs)
+	newProc, err := s.doSpawnForModel(spawnCtx, runner.ModelName, "127.0.0.1", nextPort, newURLs)
 	if err != nil {
+		spawnCancel()
 		log.Printf("[Supervisor] Failed to spawn candidate for [%s]: %v", runner.ModelName, err)
 		return
 	}
 
-	log.Printf("[Supervisor] [Zero-Downtime Reload] [%s] Step 2/4: Probing candidate health on port %d...", runner.ModelName, nextPort)
-	if err := s.checkHealth(ctx, nextPort, s.cfg.HealthCheckTimeout); err != nil {
+	healthTimeout := s.cfg.HealthCheckTimeout
+	if healthTimeout <= 0 {
+		healthTimeout = 30 * time.Second
+	}
+	checkCtx, checkCancel := context.WithTimeout(context.Background(), healthTimeout)
+	defer checkCancel()
+
+	log.Printf("[Supervisor] [Zero-Downtime Reload] [%s] Step 2/4: Probing candidate health on port %d (Timeout: %v)...",
+		runner.ModelName, nextPort, healthTimeout)
+	if err := s.checkHealth(checkCtx, nextPort, healthTimeout); err != nil {
 		log.Printf("[Supervisor] Candidate health check failed for [%s] on port %d: %v. Aborting reload!", runner.ModelName, nextPort, err)
+		spawnCancel()
 		if newProc != nil && newProc.cmd != nil && newProc.cmd.Process != nil {
 			_ = newProc.cmd.Process.Kill()
 		}
@@ -1668,6 +1701,15 @@ func (s *Supervisor) performZeroDowntimeReloadForRunner(ctx context.Context, run
 		s.activeTarget = newProc.targetURL
 		s.activeURLs = newURLs
 		s.currentProc = newProc
+	} else if s.modelName == "" {
+		// Multi-model mode: aggregate active URLs across all runners
+		var allActive []string
+		for _, r := range s.runners {
+			r.mu.RLock()
+			allActive = append(allActive, r.ActiveURLs...)
+			r.mu.RUnlock()
+		}
+		s.activeURLs = allActive
 	}
 	s.mu.Unlock()
 

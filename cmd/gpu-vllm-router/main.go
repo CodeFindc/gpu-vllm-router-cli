@@ -550,6 +550,9 @@ func main() {
 			if fileCfg.CircuitBreaker.MaxFailures > 0 {
 				supCfg.WorkerMaxFailures = fileCfg.CircuitBreaker.MaxFailures
 			}
+			if fileCfg.CircuitBreaker.HealthCheckTimeout > 0 {
+				supCfg.HealthCheckTimeout = fileCfg.CircuitBreaker.HealthCheckTimeout
+			}
 			supCfg.AutoHeal = fileCfg.AutoHeal
 		}
 		sup := router.NewSupervisor(client, *modelName, supCfg)

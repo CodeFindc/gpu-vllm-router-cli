@@ -1,7 +1,10 @@
 package proxy
 
 import (
+	"bytes"
+	"encoding/json"
 	"fmt"
+	"io"
 	"log"
 	"net/http"
 	"sync"
@@ -194,18 +197,64 @@ func (cb *CircuitBreaker) GetLastProbeAndError() (time.Time, string) {
 	return cb.lastProbeTime, cb.lastError
 }
 
-// Probe actively tests the health of the target via /health or /v1/models.
+// Probe actively tests the health and readiness of the target via /v1/models (or /health).
 func (cb *CircuitBreaker) Probe() bool {
 	cb.mu.Lock()
 	cb.lastProbeTime = time.Now()
 	cb.mu.Unlock()
 
-	probeURL := fmt.Sprintf("%s/health", cb.targetURL)
-	req, err := http.NewRequest(http.MethodGet, probeURL, nil)
+	// 1. Proactive Readiness Probe via /v1/models (checks if models are loaded)
+	modelsURL := fmt.Sprintf("%s/v1/models", cb.targetURL)
+	reqModels, err := http.NewRequest(http.MethodGet, modelsURL, nil)
 	if err == nil {
-		resp, err := cb.httpClient.Do(req)
+		resp, err := cb.httpClient.Do(reqModels)
 		if err == nil {
-			resp.Body.Close()
+			defer resp.Body.Close()
+			if resp.StatusCode == http.StatusOK {
+				var modelsResp struct {
+					Data []interface{} `json:"data"`
+				}
+				bodyBytes, readErr := io.ReadAll(io.LimitReader(resp.Body, 64*1024))
+				if readErr == nil && json.Unmarshal(bodyBytes, &modelsResp) == nil {
+					if bytes.Contains(bodyBytes, []byte(`"data"`)) {
+						if len(modelsResp.Data) > 0 {
+							cb.RecordSuccess()
+							return true
+						}
+						cb.mu.Lock()
+						cb.lastError = "model instance is still loading weights (model list is empty)"
+						cb.mu.Unlock()
+						return false
+					}
+					cb.RecordSuccess()
+					return true
+				}
+				cb.RecordSuccess()
+				return true
+			}
+			if resp.StatusCode == http.StatusServiceUnavailable {
+				cb.mu.Lock()
+				cb.lastError = "probe /v1/models returned HTTP 503 (model is loading)"
+				cb.mu.Unlock()
+				return false
+			}
+			if resp.StatusCode != http.StatusNotFound {
+				cb.mu.Lock()
+				cb.lastError = fmt.Sprintf("probe /v1/models returned HTTP %d", resp.StatusCode)
+				cb.mu.Unlock()
+				return false
+			}
+			// HTTP 404: not an OpenAI models endpoint, fallback to /health
+		}
+	}
+
+	// 2. Fallback Liveness Probe via /health (for non-OpenAI or mock backends)
+	probeURL := fmt.Sprintf("%s/health", cb.targetURL)
+	reqHealth, err := http.NewRequest(http.MethodGet, probeURL, nil)
+	if err == nil {
+		resp, err := cb.httpClient.Do(reqHealth)
+		if err == nil {
+			defer resp.Body.Close()
 			if resp.StatusCode == http.StatusOK {
 				cb.RecordSuccess()
 				return true
@@ -221,31 +270,6 @@ func (cb *CircuitBreaker) Probe() bool {
 	} else {
 		cb.mu.Lock()
 		cb.lastError = fmt.Sprintf("probe /health request error: %v", err)
-		cb.mu.Unlock()
-	}
-
-	// Fallback to /v1/models
-	modelsURL := fmt.Sprintf("%s/v1/models", cb.targetURL)
-	req2, err2 := http.NewRequest(http.MethodGet, modelsURL, nil)
-	if err2 == nil {
-		resp2, err2 := cb.httpClient.Do(req2)
-		if err2 == nil {
-			resp2.Body.Close()
-			if resp2.StatusCode == http.StatusOK {
-				cb.RecordSuccess()
-				return true
-			}
-			cb.mu.Lock()
-			cb.lastError = fmt.Sprintf("probe /v1/models returned HTTP %d", resp2.StatusCode)
-			cb.mu.Unlock()
-		} else {
-			cb.mu.Lock()
-			cb.lastError = fmt.Sprintf("probe /v1/models error: %v", err2)
-			cb.mu.Unlock()
-		}
-	} else {
-		cb.mu.Lock()
-		cb.lastError = fmt.Sprintf("probe /v1/models request error: %v", err2)
 		cb.mu.Unlock()
 	}
 
