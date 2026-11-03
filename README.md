@@ -11,11 +11,13 @@
 `gpu-vllm-router-cli` 是一个专为 **[GPUStack](https://github.com/gpustack/gpustack)** AI 集群与 **[vLLM-Router](https://github.com/vllm-project/router)**（vLLM 官方高性能请求路由器）打造的纯 Go 命令行工具与轻量后端桥接系统。
 
 本项目为**零前端依赖的纯后端 CLI 版本**（不含 Node.js / React 前端页面，无多余构建负担，体积小巧、编译极速），核心聚焦于：
-1. **生成后端启动指令 (`-mode cmd`)**：一键发现 GPUStack 实例并生成官方 vLLM-Router 的标准 Bash、PowerShell、Docker 启动指令。
+1. **生成后端启动指令 (`-mode cmd`)**：一键发现 GPUStack 实例（或结合手动静态实例）并生成官方 vLLM-Router 的标准 Bash、PowerShell、Docker 启动指令。
 2. **内置纯 Go 高可用网关 (`-mode proxy`)**：零外部依赖，直接作为兼容 OpenAI API 的反向代理网关。
 3. **官方路由器守护与热重载 (`-mode run`)**：双进程蓝绿零停机滚动热重载。
-4. **独立 Prometheus 监控体系**：专用 29000 端口导出官方 `vllm_router_` 标准指标群。
-5. **深度就绪探测与故障自愈**：优先校验 `/v1/models` 防模型加载中击穿，自动捕获 CUDA OOM 并触发冷却重启与现场审计归档。
+4. **支持纯手动独立运行与 GPUStack 混合合并**：既可完全脱离 GPUStack（通过 `worker_urls` / `-worker-urls` 纯手动添加后端实例），也可将手动静态实例与 GPUStack 动态实例自动去重合并，支持运行时通过 REST API 热添加模型与实例。
+5. **全生命周期调用状态日志与子进程日志追踪**：端到端全链路 `Request-ID` 贯穿，记录 `[Call:RECV]`、`[Call:ROUTE]`、`[Call:RETRY]`、`[Call:RESP]`、`[Call:DONE]` 及 4xx/5xx 错误响应快照，实时采集并清洗官方 `vllm-router` 子进程日志统一落盘至 `router.log`。
+6. **独立 Prometheus 监控体系**：专用 29000 端口导出官方 `vllm_router_` 标准指标群。
+7. **深度就绪探测与故障自愈**：优先校验 `/v1/models` 防模型加载中击穿，自动捕获 CUDA OOM 并触发冷却重启与现场审计归档。
 
 ---
 
@@ -29,18 +31,20 @@
   - [2. 模式一：生成启动命令 (`-mode cmd`)](#2-模式一生成启动命令--mode-cmd)
   - [3. 模式二：内置 Go 高可用网关 (`-mode proxy` 全集群多模型负载)](#3-模式二内置-go-高可用网关--mode-proxy-全集群多模型负载)
   - [4. 模式三：官方路由器守护与零停机重载 (`-mode run`)](#4-模式三官方路由器守护与零停机重载--mode-run)
+  - [5. 手动添加后端实例与混合运行场景（纯手动模式 / 混合模式 / API 热添加）](#5-手动添加后端实例与混合运行场景纯手动模式--混合模式--api-热添加)
 - [五、全集群多模型动态路由机制](#五全集群多模型动态路由机制)
 - [六、零停机热重载（Zero-Downtime）原理解析](#六零停机热重载zero-downtime原理解析)
 - [七、熔断器（Circuit Breaker）与透明故障转移（Failover Retry）](#七熔断器circuit-breaker与透明故障转移failover-retry)
 - [八、大模型权重加载与深度就绪探测（Readiness Probing）](#八大模型权重加载与深度就绪探测readiness-probing)
 - [九、无人值守自动化故障自愈（Auto-Heal）机制](#九无人值守自动化故障自愈auto-heal机制)
 - [十、Prometheus 监控体系与核心指标规范（Port 29000）](#十prometheus-监控体系与核心指标规范port-29000)
-- [十一、命令行参数与环境变量全集](#十一命令行参数与环境变量全集)
-- [十二、配置文件使用 (`config.yaml`)](#十二配置文件使用-configyaml)
-- [十三、管理、监控与 API 文档接口](#十三管理监控与-api-文档接口)
-- [十四、生产部署与运维建议](#十四生产部署与运维建议)
-- [十五、编译、测试与性能基准](#十五编译测试与性能基准)
-- [十六、Docker 与 Docker-Compose 容器化部署](#十六docker-与-docker-compose-容器化部署)
+- [十一、全生命周期调用状态追踪与日志体系](#十一全生命周期调用状态追踪与日志体系)
+- [十二、命令行参数与环境变量全集](#十二命令行参数与环境变量全集)
+- [十三、配置文件使用 (`config.yaml`)](#十三配置文件使用-configyaml)
+- [十四、管理、监控与 API 文档接口](#十四管理监控与-api-文档接口)
+- [十五、生产部署与运维建议](#十五生产部署与运维建议)
+- [十六、编译、测试与性能基准](#十六编译测试与性能基准)
+- [十七、Docker 与 Docker-Compose 容器化部署](#十七docker-与-docker-compose-容器化部署)
 
 ---
 
@@ -157,13 +161,14 @@ flowchart TD
    - 覆盖一致性哈希、Prefix-Caching 缓存感知、轮询、P2C、随机分发等算法，兼顾高并发吞吐与大模型 KV-Cache 上下文命中率。
    - 多模型模式下，各个模型拥有**完全独立的负载均衡器**，互不干扰。
 
-7. **双重保障运行形态**
+7. **双重保障运行形态与手动/动态混合实例纳管**
    - **支持官方 Rust 二进制 (`-mode run`)**：完整兼容 `vllm-project/router` 官方参数体系，蓝绿双进程无感切换与 60s 优雅排空。
    - **支持零依赖纯 Go 网关 (`-mode proxy`)**：本地未安装 Rust/Cargo 也能立即运行，毫秒级流式转发与状态管理。
+   - **支持纯手动独立运行与混合合并**：支持通过 `config.yaml` (`target.worker_urls` / `models[].worker_urls`)、CLI 参数 (`-worker-urls`) 或管理接口 (`POST /api/models/rule`) 手动添加 Worker 实例，既可脱离 GPUStack 独立运行（`-gpustack-url off`），也可与 GPUStack 自动发现实例去重合并，统一参与主动健康探测与熔断隔离。
 
-8. **细粒度日志分级与模型日志隔离**
-   - 支持 `debug`、`info`、`warn`、`error` 四级日志动态过滤。常规高频路由日志降级为 `debug`，杜绝日志全局互斥锁瓶颈。
-   - 支持模型级别日志隔离归档（`log_dir`），方便精细化运维排查。
+8. **全生命周期调用状态追踪与多进程统一日志体系**
+   - **四阶段全链路调用追踪**：为每个请求自动分配或透传唯一 `X-Request-ID`，完整记录请求进入 (`[Call:RECV]`)、路由命中 (`[Call:ROUTE]`)、故障重试 (`[Call:RETRY]`)、首包响应 (`[Call:RESP]`) 与结束汇总 (`[Call:DONE]` / `[Call:ABORT]` / `[Call:FAIL]`)，精确统计 `TTFB`、`Transfer` 与 `TotalCost` 耗时，并在 4xx/5xx 异常时无损抓取请求体与错误响应摘要。
+   - **官方子进程与主控日志统一落盘**：实时采集 `vllm-router` 子进程标准输出与错误流，自动剥离 ANSI 颜色控制符并附加 `[vllm-router:端口|模型名]` 前缀，支持通过 `log_file` 双写持久化至 `logs/router.log`，并支持按模型分目录归档 (`log_dir`)。
 
 ---
 
@@ -355,6 +360,69 @@ docker run --rm -it --network host -p 8000:8000 vllm/vllm-router:latest --host 0
     -drain-timeout=60s
 ```
 只为该目标模型拉起官方 `vllm-router` 并进行单模型蓝绿滚动热重载。
+
+---
+
+### 5. 手动添加后端实例与混合运行场景（纯手动模式 / 混合模式 / API 热添加）
+
+除了从 GPUStack 自动发现实例外，`run`、`proxy` 与 `cmd` 三大模式均支持**纯手动独立运行**（无 GPUStack 环境）或 **GPUStack 动态实例 + 手动静态实例混合去重合并**。手动添加的实例同样自动纳入主动健康探测（Readiness Probing）与三态熔断隔离。
+
+#### 场景 A：通过 CLI 参数 `-worker-urls` 纯手动或混合启动
+```powershell
+# 1. 纯手动独立运行官方 vllm-router (将 -gpustack-url 设为 off，完全脱离 GPUStack)
+.\gpu-vllm-router.exe `
+    -mode run `
+    -gpustack-url off `
+    -model "Qwen3.6-27B" `
+    -policy power_of_two `
+    -worker-urls "http://192.168.1.60:8000,http://192.168.1.61:8000"
+
+# 2. 混合模式：自动发现 GPUStack 实例，并额外合并手动指定的静态算力节点
+.\gpu-vllm-router.exe `
+    -mode run `
+    -gpustack-url "http://192.168.1.100:8200" `
+    -model "Qwen3.6-27B" `
+    -worker-urls "http://192.168.1.60:8000,http://192.168.1.61:8000"
+```
+
+#### 场景 B：通过 `config.yaml` 静态配置单模型或多模型手动实例
+```yaml
+# 若需纯手动脱离 GPUStack 独立运行，可将 base_url 设为 "off"
+gpustack:
+  base_url: "off"
+
+target:
+  model_name: ""
+  policy: "consistent_hash"
+  # 单模型或默认池手动静态实例列表:
+  # worker_urls:
+  #   - "http://192.168.1.50:8000"
+  #   - "http://192.168.1.51:8000"
+
+models:
+  - model_name: "Qwen3.6-27B"
+    mode: "run"
+    policy: "power_of_two"
+    worker_urls:
+      - "http://192.168.1.60:8000"
+      - "http://192.168.1.61:8000"
+```
+
+#### 场景 C：运行时通过管理 API (`POST /api/models/rule`) 动态热添加模型与实例
+无需重启服务，直接调用 REST API 即可在运行期热添加全新模型池或追加手动 Worker 实例（自动触发零停机蓝绿热重载并持久化写回 `config.yaml`）：
+```bash
+curl -X POST http://127.0.0.1:8000/api/models/rule \
+  -H "Content-Type: application/json" \
+  -d '{
+    "model_name": "DeepSeek-R1-Manual",
+    "mode": "run",
+    "policy": "cache_aware",
+    "worker_urls": [
+      "http://192.168.1.70:8000",
+      "http://192.168.1.71:8000"
+    ]
+  }'
+```
 
 ---
 
@@ -572,33 +640,59 @@ scrape_configs:
 
 ---
 
-## 十一、命令行参数与环境变量全集
+## 十一、全生命周期调用状态追踪与日志体系
+
+为彻底解决高并发与多进程架构下的请求排障痛点，系统内置了**全生命周期调用状态追踪器 (`CallTrace`)** 与 **多进程统一日志采集管道**：
+
+### 1. 请求全生命周期状态日志（4 阶段 + 异常快照）
+每一个进入网关（`proxy` 或 `run` 模式）的请求都会自动提取或生成全局唯一的 `X-Request-ID`（并通过响应头返回给客户端），按生命周期输出结构化日志：
+
+- **`[Call:RECV]`（请求进入）**：记录客户端 IP、请求方法与路径、目标模型名、`Stream` 流式标识、请求体字节大小与提取到的会话亲和 Key。
+- **`[Call:ROUTE]`（路由命中）**：记录选定的负载均衡策略、目标 Worker URL、所属物理节点名称（`Worker`）与实例名称（`Instance`）以及当前并发连接数（`ActiveConns`）。
+- **`[Call:RETRY]`（透明故障重试，发生故障转移时输出）**：记录失败的 Worker、失败原因與耗时，以及自动切换的下一个健康目标节点。
+- **`[Call:RESP]` / `[Call:RESP_ERR]`（首包响应与异常报文快照）**：记录后端 HTTP 状态码与首包延迟（`TTFB`）。当后端返回 **HTTP 4xx/5xx** 时，以无损流回放方式自动抓取前 512B 的请求参数摘要与后端错误响应体内容，便于直接定位参数错误或推理引擎报错。
+- **`[Call:DONE]` / `[Call:ABORT]` / `[Call:FAIL]`（结束汇总）**：记录总耗时（`TotalCost`）、首包耗时（`TTFB`）、流式传输耗时（`Transfer`）、响应总字节数（`Bytes`）与重试次数；若客户端中途主动断开连接，明确标记 `499 Client Disconnected`。
+
+**日志输出示例：**
+```text
+2026/11/03 10:26:15 [INFO] [Call:RECV] [ReqID: req-775040-a279e990] 📥 收到调用请求 | Client: 192.168.1.5 | POST /v1/chat/completions | Model: "Qwen3.6-27B" | Stream: true | BodySize: 142B | Session: "sess-1001"
+2026/11/03 10:26:15 [INFO] [Call:ROUTE] [ReqID: req-775040-a279e990] 🎯 路由命中 | Model: Qwen3.6-27B | Policy: consistent_hash | Target: http://192.168.1.60:8000 (Worker: worker-node-1, Instance: Qwen3.6-27B-inst1) | ActiveConns: 1 | Key: sess-1001
+2026/11/03 10:26:15 [INFO] [Call:RESP] [ReqID: req-775040-a279e990] 📡 后端首包响应 | Status: 200 | Model: Qwen3.6-27B | Worker: http://192.168.1.60:8000 (Worker: worker-node-1, Instance: Qwen3.6-27B-inst1) | TTFB: 42.3ms | Type: text/event-stream | Retries: 0
+2026/11/03 10:26:17 [INFO] [Call:DONE] [ReqID: req-775040-a279e990] ✅ 调用完成 | Status: 200 | Model: Qwen3.6-27B | Worker: http://192.168.1.60:8000 (Worker: worker-node-1, Instance: Qwen3.6-27B-inst1) | TotalCost: 1.84s (TTFB: 42.3ms, Transfer: 1.80s) | Bytes: 4128B | Stream: true | Retries: 0
+```
+
+### 2. 官方 `vllm-router` 子进程与主控日志统一跟踪
+- **启动服务发现落盘 (`[Discovery]`)**：启动阶段发现的所有 GPUStack 实例与手动静态实例明细同步写入主日志文件。
+- **子进程输出清洗与标签化**：实时捕获 `vllm-router` 子进程的 `stdout` / `stderr`，自动剥离 Rust ANSI 颜色转义字符，统一附加 `[vllm-router:<内部端口>|<模型名称>]` 标识并映射日志级别。
+- **管理操作审计 (`[Admin:API]`)**：所有通过 `/api/probe`、`/api/reset-breaker`、`/api/config`、`/api/models/rule` 触发的运维操作均自动记录审计日志。
+
+---
+
+## 十二、命令行参数与环境变量全集
 
 | 参数名称 | 环境变量对应 | 默认值 | 详细说明 |
 | :--- | :--- | :--- | :--- |
+| `-config` | - | *(自动检测 `config.yaml`)* | YAML 配置文件路径 |
 | `-model` | - | *(空)* | **选填**。留空自动开启【全集群多模型自动纳管】；指定名称锁定单模型 |
+| `-worker-urls` | - | *(空)* | **手动指定的后端 Worker 实例 URL 列表** (逗号分隔，支持脱离 GPUStack 独立运行或与 GPUStack 混合合并) |
 | `-mode` | - | `cmd` | 运行模式：`cmd` (输出启动命令), `proxy` (内置多模型网关), `run` (守护官方路由器) |
 | `-policy` | - | `consistent_hash` | 负载策略：`consistent_hash`, `cache_aware`, `round_robin`, `power_of_two`, `random`, `rendezvous_hash` |
-| `-gpustack-url` | `GPUSTACK_BASE_URL` | `http://127.0.0.1:8200` | GPUStack API 服务地址 |
+| `-gpustack-url` | `GPUSTACK_BASE_URL` | `http://127.0.0.1:8200` | GPUStack API 服务地址 (设为 `off` 或 `none` 可启用纯手动独立运行模式) |
 | `-username` | `GPUSTACK_USERNAME` | `admin` | GPUStack 登录管理员用户名 |
 | `-password` | `GPUSTACK_PASSWORD` | *(空)* | GPUStack 登录密码 |
 | `-api-key` | `GPUSTACK_API_KEY` | *(空)* | GPUStack 认证 Token (如有，优先于用户名密码) |
 | `-port` | - | `8000` | 路由器对外监听业务与 API 的主端口 |
 | `-host` | - | `0.0.0.0` | 路由器业务服务对外绑定的网络地址 |
 | `-metrics-port` | `METRICS_PORT` | `29000` | **Prometheus 监控指标专用服务端口** (避免与业务请求锁争用) |
-| `-metrics-host` | `METRICS_HOST` | `0.0.0.0` | Prometheus 监控指标监听网络地址 |
 | `-router-bin` | - | `vllm-router` | 官方 `vllm-router` 可执行文件所在路径或名称 |
 | `-backend` | - | `vllm` | 后端推理引擎类型 (`vllm`, `sglang`, `trtllm`, `openai`, `anthropic`) |
-| `-log-level` | - | `info` | 路由器日志输出级别 (`debug`, `info`, `warn`, `error`) |
-| `-log-dir` | - | *(空)* | 路由器全局日志文件存储目录 |
+| `-log-level` | - | `info` | 全局与官方 `vllm-router` 日志输出级别 (`debug`, `info`, `warn`, `error`) |
+| `-app-log-level` | - | *(继承 `log-level`)* | 主调度网关自身独立日志级别 (`debug`, `info`, `warn`, `error`) |
+| `-log-dir` | - | *(空)* | 官方 `vllm-router` 子进程滚动日志存储目录 (多模型下自动按模型分子目录) |
+| `-log-file` | - | *(自动检测 `logs/router.log`)* | 调度器主控与各子进程汇总运行物理日志文件路径 (`off` 可禁用文件落盘) |
 | `-watch-interval` | - | `10s` | 定时向 GPUStack 查询实例拓扑变动的周期 (如 10s, 30s) |
 | `-zero-downtime` | - | `true` | `run` 模式下是否启用蓝绿双进程零停机无损热重载 |
 | `-drain-timeout` | - | `60s` | `run` 模式切流后，给旧路由器进程保留的流式长连接排空等待时间 |
-| `-health-check-timeout` | - | `30s` | 蓝绿候选进程健康检查就绪超时时间 |
-| `-auto-heal-enabled` | - | `true` | 是否启用无人值守大模型 CUDA OOM 自动自愈 |
-| `-auto-heal-max-restarts` | - | `3` | 故障实例最大连续自动重启次数限制 (防频繁抖动) |
-| `-auto-heal-cooldown` | - | `60s` | 两次自愈重启之间的冷却时间间隔 |
-| `-auto-heal-log-dir` | - | `logs/crashes` | 故障发生时现场崩溃日志与审计文件落盘目录 |
 | `-dp-size` | - | `1` | 数据并行副本数 (Intra-Node Data Parallel Size) |
 | `-balance-abs-threshold` | - | `0` (默认64) | 官方 `vllm-router` 负载绝对差均衡阈值 (针对 `cache_aware`) |
 | `-balance-rel-threshold` | - | `0.0` (默认1.5) | 官方 `vllm-router` 负载相对比均衡阈值 |
@@ -610,40 +704,43 @@ scrape_configs:
 | `-vllm-discovery-address` | - | *(空)* | ZMQ 服务发现协调注册地址 (如 `0.0.0.0:30001`) |
 | `-prefill-policy` | - | *(空)* | PD 模式下 Prefill 节点调度策略 |
 | `-decode-policy` | - | *(空)* | PD 模式下 Decode 节点调度策略 |
+| `-worker-startup-timeout-secs` | - | `0` (默认600) | Worker 实例启动等待超时时间秒数 |
+| `-worker-startup-check-interval` | - | `0` (默认30) | Worker 实例就绪探测轮询周期秒数 |
 | `-extra-args` | - | *(空)* | 额外自定义 CLI 参数透传 (空格分隔) |
 | `-list-models` | - | `false` | 快速列出 GPUStack 集群当前所有模型及其状态后退出 |
 | `-list-policies` | - | `false` | 快速列出所有受支持负载均衡模式的详细说明后退出 |
 
 ---
 
-## 十二、配置文件使用 (`config.yaml`)
+## 十三、配置文件使用 (`config.yaml`)
 
 除了命令行参数外，推荐使用 `config.yaml` 统一配置，可直接参考并复用 [`config.example.yaml`](config.example.yaml)：
 
 ```yaml
 # 核心字段速览 (详见 config.example.yaml)
 gpustack:
-  base_url: "http://<GPUSTACK_HOST>:8200"
+  base_url: "http://<GPUSTACK_HOST>:8200" # 设为 "off" 可脱离 GPUStack 纯手动运行
   username: "admin"
   password: "your_password"
 
 target:
   model_name: ""               # 留空代表全集群多模型自动聚合
   policy: "consistent_hash"    # 默认负载调度策略
+  # worker_urls:               # 可选：手动添加的全局/单模型静态 Worker 实例地址
+  #   - "http://192.168.1.50:8000"
 
 router:
   mode: "proxy"               # cmd | proxy | run
   host: "0.0.0.0"
   port: 8000                  # 业务网关主端口
+  metrics_port: 29000         # Prometheus 监控指标独立端口
   backend: "vllm"             # vllm | sglang | trtllm | openai | anthropic
   log_level: "info"           # debug | info | warn | error
+  # app_log_level: "info"     # 主调度网关自身独立日志级别 (可选)
+  log_dir: "/app/logs/vllm-router"
+  log_file: "/app/logs/router.log"
   zero_downtime: true
   drain_timeout: 60s
-  health_check_timeout: 30s
-
-metrics:
-  port: 29000                 # Prometheus 监控指标独立端口
-  host: "0.0.0.0"
 
 circuit_breaker:
   enabled: true               # 是否开启断路器与透明重试
@@ -653,22 +750,26 @@ circuit_breaker:
   health_check_interval: 3s   # 隔离节点后台自愈嗅探周期
 
 auto_heal:
-  enabled: true               # 是否开启无人值守故障自愈
+  enabled: false              # 是否开启无人值守故障自愈
   max_restart_attempts: 3     # 单实例连续重启上限 (防抖保护)
-  restart_cooldown: 60s       # 重启冷却时间
-  log_dir: "logs/crashes"     # 故障取证日志落盘目录
+  restart_cooldown: 5m        # 重启冷却时间
+  crash_log_dir: "logs/crashes" # 故障取证日志落盘目录
 
-# 支持针对个别模型进行独立规则与隔离日志目录覆盖：
+# 支持针对个别模型进行独立规则、手动静态实例与隔离日志目录覆盖：
 # models:
 #   - model_name: "DeepSeek-V4-Flash-0731-w8a8"
+#     mode: "run"
 #     policy: "cache_aware"
 #     cache_threshold: 0.6
-#     log_dir: "logs/deepseek"
+#     worker_urls:
+#       - "http://192.168.1.60:8000"
+#       - "http://192.168.1.61:8000"
+#     log_dir: "/app/logs/deepseek"
 ```
 
 ---
 
-## 十三、管理、监控与 API 文档接口
+## 十四、管理、监控与 API 文档接口
 
 程序对外提供分端口的管理、监控与交互式 API 文档：
 
@@ -684,7 +785,7 @@ auto_heal:
 | `/openapi.json` | `GET` | OpenAPI 3.0.3 规范描述文件（支持直接导入 Postman / Apifox） |
 | `/api/topology` | `GET` | 查看集群模型拓扑、在线 Worker 节点与熔断状态 |
 | `/api/config` | `GET` / `POST` | 查看当前生效配置或热更新配置 |
-| `/api/models/rule` | `POST` | 动态新增或修改特定模型的路由规则与阈值 |
+| `/api/models/rule` | `POST` | 动态新增或修改特定模型的路由规则、模式、阈值及手动 `worker_urls` 实例列表 |
 | `/health` | `GET` | 路由器健康检查接口，正常返回 `{"status":"ok"}` |
 | `/admin/stats` | `GET` | *(Proxy 模式)* 查看全集群各模型 Worker 列表、健康状态、熔断状态及活跃连接数 |
 | `/admin/supervisor` | `GET` | *(Run 模式)* 查看 Supervisor 守护状态、当前主力内部端口及后端 Worker 总数 |
@@ -698,7 +799,7 @@ auto_heal:
 
 ---
 
-## 十四、生产部署与运维建议
+## 十五、生产部署与运维建议
 
 ### 1. Linux Systemd 守护进程托管示例
 在生产 Linux 环境中，可编写 `/etc/systemd/system/gpu-vllm-router.service`：
@@ -728,7 +829,7 @@ WantedBy=multi-user.target
 
 ---
 
-## 十五、编译、测试与性能基准
+## 十六、编译、测试与性能基准
 
 本项目采用 Go 官方标准库编写，零冗余第三方框架依赖，支持跨平台一键编译：
 
@@ -754,7 +855,7 @@ $env:GOOS="linux"; $env:GOARCH="amd64"; go build -o gpu-vllm-router-linux ./cmd/
 
 ---
 
-## 十六、Docker 与 Docker-Compose 容器化部署
+## 十七、Docker 与 Docker-Compose 容器化部署
 
 项目提供生产级多阶段构建 `Dockerfile` 与 `Dockerfile.cn`（内置最新官方 `vllm-router` Rust 二进制与 Go 调度服务）和支持动态挂载配置文件的 `docker-compose.yml` / `docker-compose.cn.yml`。
 

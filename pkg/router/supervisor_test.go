@@ -615,5 +615,85 @@ func TestSupervisorCallLogging(t *testing.T) {
 	}
 }
 
+func TestSupervisor_PureManualAndRuntimeAddWorkers(t *testing.T) {
+	mockWorker1 := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		w.WriteHeader(http.StatusOK)
+		_, _ = w.Write([]byte(`{"choices":[{"message":{"content":"from_manual_worker_1"}}]}`))
+	}))
+	defer mockWorker1.Close()
+
+	mockWorker2 := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		w.WriteHeader(http.StatusOK)
+		_, _ = w.Write([]byte(`{"choices":[{"message":{"content":"from_manual_worker_2"}}]}`))
+	}))
+	defer mockWorker2.Close()
+
+	pubPort, err := getFreePort()
+	if err != nil {
+		t.Fatalf("getFreePort failed: %v", err)
+	}
+
+	tmpCfg := filepath.Join(t.TempDir(), "config.yaml")
+	sup := NewSupervisor(nil, "", SupervisorConfig{
+		PublicHost:     "127.0.0.1",
+		PublicPort:     pubPort,
+		MetricsPort:    0,
+		ZeroDowntime:   true,
+		ConfigFilePath: tmpCfg,
+		RouterCfg: Config{
+			Policy: PolicyRoundRobin,
+		},
+		ModelRules: []config.ModelRule{
+			{
+				ModelName:  "manual-model-a",
+				Mode:       "proxy",
+				Policy:     "round_robin",
+				WorkerURLs: []string{mockWorker1.URL},
+			},
+		},
+	})
+
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+
+	if err := sup.Start(ctx); err != nil {
+		t.Fatalf("Supervisor.Start in pure manual mode failed: %v", err)
+	}
+	defer sup.Stop()
+
+	topo, err := sup.GetTopology(ctx)
+	if err != nil {
+		t.Fatalf("GetTopology failed: %v", err)
+	}
+	if topo.TotalModels != 1 || topo.TotalWorkers != 1 {
+		t.Fatalf("expected 1 manual model and 1 worker, got models=%d workers=%d", topo.TotalModels, topo.TotalWorkers)
+	}
+
+	// Dynamically add a second manual model via UpdateModelRule
+	snap, err := sup.UpdateModelRule(ctx, dashboard.ModelRuleUpdateRequest{
+		ModelName:  "manual-model-b",
+		Mode:       "proxy",
+		Policy:     "consistent_hash",
+		WorkerURLs: []string{mockWorker2.URL},
+	})
+	if err != nil {
+		t.Fatalf("UpdateModelRule failed: %v", err)
+	}
+	if len(snap.Models) != 2 {
+		t.Fatalf("expected 2 models in ConfigSnapshot after runtime add, got %d", len(snap.Models))
+	}
+
+	// Route a request to the newly added manual-model-b
+	req := httptest.NewRequest(http.MethodPost, "/v1/chat/completions", strings.NewReader(`{"model":"manual-model-b","messages":[{"role":"user","content":"hi"}]}`))
+	rw := httptest.NewRecorder()
+	sup.handleProxy(rw, req)
+	if rw.Code != http.StatusOK || !strings.Contains(rw.Body.String(), "from_manual_worker_2") {
+		t.Fatalf("expected 200 from_manual_worker_2, got status=%d body=%s", rw.Code, rw.Body.String())
+	}
+}
+
+
 
 

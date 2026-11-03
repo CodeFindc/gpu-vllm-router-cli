@@ -98,6 +98,7 @@ func main() {
 
 	// Model Flags
 	modelName := flag.String("model", "", "GPUStack 中已启动的目标模型名称 (如: DeepSeek-V4-Flash-0731-w8a8)")
+	workerURLsFlag := flag.String("worker-urls", "", "手动指定的后端 Worker 实例 URL 列表 (逗号分隔，支持脱离 GPUStack 独立运行或混合合并)")
 	listModels := flag.Bool("list-models", false, "列出 GPUStack 当前所有已注册模型及其实例状态")
 
 	// Policy Flags
@@ -293,18 +294,44 @@ func main() {
 		log.Fatalf("配置错误: %v", err)
 	}
 
-	// Initialize GPUStack Client
-	clientCfg := gpustack.Config{
-		BaseURL:  *gpustackURL,
-		APIKey:   *apiKey,
-		Username: *username,
-		Password: *password,
-		Timeout:  10 * time.Second,
+	// Collect manual static Worker URLs from CLI and/or YAML config
+	var staticWorkerURLs []string
+	if explicitFlags["worker-urls"] && *workerURLsFlag != "" {
+		staticWorkerURLs = config.NormalizeWorkerURLs([]string{*workerURLsFlag})
+	} else if fileCfg != nil && len(fileCfg.Target.WorkerURLs) > 0 {
+		staticWorkerURLs = config.NormalizeWorkerURLs(fileCfg.Target.WorkerURLs)
 	}
 
-	client, err := gpustack.NewClient(clientCfg)
-	if err != nil {
-		log.Fatalf("初始化 GPUStack 客户端失败: %v", err)
+	var allConfigManualURLs []string
+	allConfigManualURLs = append(allConfigManualURLs, staticWorkerURLs...)
+	if fileCfg != nil {
+		for _, m := range fileCfg.Models {
+			allConfigManualURLs = append(allConfigManualURLs, m.WorkerURLs...)
+		}
+	}
+	allConfigManualURLs = config.NormalizeWorkerURLs(allConfigManualURLs)
+
+	// Initialize GPUStack Client (optional if disabled or running in pure manual mode)
+	var client *gpustack.Client
+	gpustackDisabled := strings.EqualFold(*gpustackURL, "off") || strings.EqualFold(*gpustackURL, "none") || strings.TrimSpace(*gpustackURL) == ""
+	if !gpustackDisabled {
+		clientCfg := gpustack.Config{
+			BaseURL:  *gpustackURL,
+			APIKey:   *apiKey,
+			Username: *username,
+			Password: *password,
+			Timeout:  10 * time.Second,
+		}
+		c, err := gpustack.NewClient(clientCfg)
+		if err != nil {
+			if len(allConfigManualURLs) > 0 {
+				log.Printf("⚠️ 初始化 GPUStack 客户端失败 (%v)，将切换为纯手动静态实例模式运行", err)
+			} else {
+				log.Fatalf("初始化 GPUStack 客户端失败: %v", err)
+			}
+		} else {
+			client = c
+		}
 	}
 
 	ctx, cancel := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
@@ -312,6 +339,9 @@ func main() {
 
 	// 2. If user requested --list-models
 	if *listModels {
+		if client == nil {
+			log.Fatalf("当前未启用 GPUStack 客户端 (--gpustack-url=%s)，无法查询远程模型列表", *gpustackURL)
+		}
 		printHelpBanner()
 		fmt.Printf("正在从 GPUStack (%s) 获取模型列表...\n", *gpustackURL)
 		models, err := client.GetModels(ctx)
@@ -330,11 +360,18 @@ func main() {
 	}
 
 	printHelpBanner()
-	log.Printf("目标 GPUStack 地址: %s", *gpustackURL)
+	if client != nil {
+		log.Printf("目标 GPUStack 地址: %s", *gpustackURL)
+	} else {
+		log.Printf("目标 GPUStack 地址: 已禁用 (纯手动静态实例模式)")
+	}
 	if *modelName != "" {
 		log.Printf("指定目标模型名称:   %s (单模型定向模式)", *modelName)
 	} else {
 		log.Printf("运行调度模式:       全集群多模型自动同步负载模式 (未指定固定模型，自动纳管所有模型)")
+	}
+	if len(allConfigManualURLs) > 0 {
+		log.Printf("手动静态实例数量:   %d (%v)", len(allConfigManualURLs), allConfigManualURLs)
 	}
 	log.Printf("选定负载均衡策略:   %s", selectedPolicy)
 	log.Printf("运行模式:           %s", *mode)
@@ -342,75 +379,109 @@ func main() {
 	var workerURLs []string
 	var sampleModelName string
 
-	if *modelName != "" {
-		// Single Model Mode
-		endpoints, model, err := client.GetRunningWorkerEndpoints(ctx, *modelName)
-		if err != nil {
-			if *mode == "cmd" {
-				log.Fatalf("发现模型实例失败: %v", err)
-			}
-			log.Printf("⚠️ 发现模型实例警告 (启动进入待机模式): %v", err)
-		}
-		if len(endpoints) == 0 {
-			if *mode == "cmd" {
-				log.Fatalf("模型 %q 当前没有处于 running 状态的实例工作点！", *modelName)
-			}
-			log.Printf("⚠️ 模型 %q 当前没有处于 running 状态的实例工作点 (启动进入待机模式)", *modelName)
-		} else {
-			sampleModelName = model.Name
-			fmt.Println("\n================= GPUStack 单模型实例服务发现结果 =================")
-			fmt.Printf("模型名称: %s (ID: %d, 后端: %s)\n", model.Name, model.ID, model.Backend)
-			fmt.Printf("健康工作点数量: %d\n", len(endpoints))
-			fmt.Println("-------------------------------------------------------------------")
-			fmt.Printf("%-18s | %-15s | %-16s | %-6s | %s\n", "实例名称", "Worker 节点", "IP 地址", "端口", "工作点接入 URL")
-			fmt.Println("-------------------------------------------------------------------")
-			for _, ep := range endpoints {
-				fmt.Printf("%-18s | %-15s | %-16s | %-6d | %s\n", ep.InstanceName, ep.WorkerName, ep.IP, ep.Port, ep.URL)
-				if *mode != "cmd" {
-					logger.Infof("[Discovery] 模型: %s (ID: %d, 后端: %s) | 实例: %s | Worker: %s | URL: %s",
-						model.Name, model.ID, model.Backend, ep.InstanceName, ep.WorkerName, ep.URL)
+	if client != nil {
+		if *modelName != "" {
+			// Single Model Mode
+			endpoints, model, err := client.GetRunningWorkerEndpoints(ctx, *modelName)
+			if err != nil {
+				if *mode == "cmd" && len(allConfigManualURLs) == 0 {
+					log.Fatalf("发现模型实例失败: %v", err)
 				}
-				workerURLs = append(workerURLs, ep.URL)
+				log.Printf("⚠️ 发现模型实例警告: %v", err)
 			}
-			fmt.Println("===================================================================")
-			fmt.Println()
-		}
-	} else {
-		// Full Cluster Multi-Model Mode
-		cluster, err := client.GetAllRunningWorkerEndpoints(ctx)
-		if err != nil {
-			if *mode == "cmd" {
-				log.Fatalf("全集群服务发现失败: %v", err)
-			}
-			log.Printf("⚠️ 全集群服务发现警告 (启动进入待机模式): %v", err)
-		}
-		if cluster == nil || cluster.InstanceCount == 0 {
-			if *mode == "cmd" {
-				log.Fatalf("GPUStack 集群当前没有处于 running 状态的任何模型实例！")
-			}
-			log.Printf("⚠️ GPUStack 集群当前没有处于 running 状态的模型实例 (启动进入待机模式，将在后台自动同步感知)")
-		} else {
-			fmt.Println("\n================= GPUStack 全集群多模型服务发现结果 =================")
-			fmt.Printf("在线模型数量: %d | 运行中工作点总数: %d\n", cluster.ModelCount, cluster.InstanceCount)
-			fmt.Println("-------------------------------------------------------------------")
-			for mName, eps := range cluster.ModelsEndpoints {
-				if sampleModelName == "" {
-					sampleModelName = mName
+			if len(endpoints) == 0 {
+				if *mode == "cmd" && len(allConfigManualURLs) == 0 {
+					log.Fatalf("模型 %q 当前没有处于 running 状态的实例工作点！", *modelName)
 				}
-				fmt.Printf("▶ 模型: %s (就绪副本: %d)\n", mName, len(eps))
-				for _, ep := range eps {
-					fmt.Printf("    -> 实例: %-25s Worker: %-12s IP: %-15s 端口: %-6d URL: %s\n",
-						ep.InstanceName, ep.WorkerName, ep.IP, ep.Port, ep.URL)
+				if len(allConfigManualURLs) == 0 {
+					log.Printf("⚠️ 模型 %q 当前没有处于 running 状态的实例工作点 (启动进入待机模式)", *modelName)
+				}
+			} else {
+				sampleModelName = model.Name
+				fmt.Println("\n================= GPUStack 单模型实例服务发现结果 =================")
+				fmt.Printf("模型名称: %s (ID: %d, 后端: %s)\n", model.Name, model.ID, model.Backend)
+				fmt.Printf("健康工作点数量: %d\n", len(endpoints))
+				fmt.Println("-------------------------------------------------------------------")
+				fmt.Printf("%-18s | %-15s | %-16s | %-6s | %s\n", "实例名称", "Worker 节点", "IP 地址", "端口", "工作点接入 URL")
+				fmt.Println("-------------------------------------------------------------------")
+				for _, ep := range endpoints {
+					fmt.Printf("%-18s | %-15s | %-16s | %-6d | %s\n", ep.InstanceName, ep.WorkerName, ep.IP, ep.Port, ep.URL)
 					if *mode != "cmd" {
-						logger.Infof("[Discovery] 模型: %s | 实例: %s | Worker: %s | URL: %s",
-							mName, ep.InstanceName, ep.WorkerName, ep.URL)
+						logger.Infof("[Discovery] 模型: %s (ID: %d, 后端: %s) | 实例: %s | Worker: %s | URL: %s",
+							model.Name, model.ID, model.Backend, ep.InstanceName, ep.WorkerName, ep.URL)
 					}
 					workerURLs = append(workerURLs, ep.URL)
 				}
+				fmt.Println("===================================================================")
+				fmt.Println()
 			}
-			fmt.Println("===================================================================")
-			fmt.Println()
+		} else {
+			// Full Cluster Multi-Model Mode
+			cluster, err := client.GetAllRunningWorkerEndpoints(ctx)
+			if err != nil {
+				if *mode == "cmd" && len(allConfigManualURLs) == 0 {
+					log.Fatalf("全集群服务发现失败: %v", err)
+				}
+				log.Printf("⚠️ 全集群服务发现警告: %v", err)
+			}
+			if cluster == nil || cluster.InstanceCount == 0 {
+				if *mode == "cmd" && len(allConfigManualURLs) == 0 {
+					log.Fatalf("GPUStack 集群当前没有处于 running 状态的任何模型实例！")
+				}
+				if len(allConfigManualURLs) == 0 {
+					log.Printf("⚠️ GPUStack 集群当前没有处于 running 状态的模型实例 (启动进入待机模式，将在后台自动同步感知)")
+				}
+			} else {
+				fmt.Println("\n================= GPUStack 全集群多模型服务发现结果 =================")
+				fmt.Printf("在线模型数量: %d | 运行中工作点总数: %d\n", cluster.ModelCount, cluster.InstanceCount)
+				fmt.Println("-------------------------------------------------------------------")
+				for mName, eps := range cluster.ModelsEndpoints {
+					if sampleModelName == "" {
+						sampleModelName = mName
+					}
+					fmt.Printf("▶ 模型: %s (就绪副本: %d)\n", mName, len(eps))
+					for _, ep := range eps {
+						fmt.Printf("    -> 实例: %-25s Worker: %-12s IP: %-15s 端口: %-6d URL: %s\n",
+							ep.InstanceName, ep.WorkerName, ep.IP, ep.Port, ep.URL)
+						if *mode != "cmd" {
+							logger.Infof("[Discovery] 模型: %s | 实例: %s | Worker: %s | URL: %s",
+								mName, ep.InstanceName, ep.WorkerName, ep.URL)
+						}
+						workerURLs = append(workerURLs, ep.URL)
+					}
+				}
+				fmt.Println("===================================================================")
+				fmt.Println()
+			}
 		}
+	}
+
+	if len(allConfigManualURLs) > 0 {
+		for _, u := range allConfigManualURLs {
+			if *mode != "cmd" {
+				mLabel := *modelName
+				if mLabel == "" {
+					mLabel = "manual"
+				}
+				logger.Infof("[Discovery] 模型: %s | 实例: manual-static | Worker: manual-static | URL: %s", mLabel, u)
+			}
+			workerURLs = append(workerURLs, u)
+		}
+		workerURLs = config.NormalizeWorkerURLs(workerURLs)
+	}
+
+	if sampleModelName == "" {
+		if *modelName != "" {
+			sampleModelName = *modelName
+		} else if fileCfg != nil && len(fileCfg.Models) > 0 {
+			sampleModelName = fileCfg.Models[0].ModelName
+		} else {
+			sampleModelName = "default"
+		}
+	}
+
+	if *mode == "cmd" && len(workerURLs) == 0 {
+		log.Fatalf("未发现任何可用的 GPUStack 实例或手动配置的 Worker URL！")
 	}
 
 	routerCfg := router.Config{
@@ -540,6 +611,9 @@ func main() {
 			modelRules = fileCfg.Models
 		}
 
+		supRouterCfg := routerCfg
+		supRouterCfg.WorkerURLs = staticWorkerURLs
+
 		supCfg := router.SupervisorConfig{
 			ZeroDowntime:   *zeroDowntime,
 			PublicHost:     *host,
@@ -547,7 +621,7 @@ func main() {
 			MetricsPort:    *metricsPort,
 			DrainTimeout:   *drainTimeout,
 			WatchInterval:  *watchInterval,
-			RouterCfg:      routerCfg,
+			RouterCfg:      supRouterCfg,
 			ConfigFilePath: resolvedConfigPath,
 			ModelRules:     modelRules,
 		}
@@ -617,6 +691,7 @@ func main() {
 			MetricsPort:         *metricsPort,
 			Policy:              selectedPolicy,
 			ModelName:           *modelName,
+			StaticWorkerURLs:    staticWorkerURLs,
 			WatchInterval:       *watchInterval,
 			CircuitBreaker:      cbCfg,
 			ConfigFilePath:      resolvedConfigPath,

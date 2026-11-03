@@ -358,3 +358,56 @@ models:
 	}
 }
 
+func TestLoadAndSaveConfigWithManualWorkerURLs(t *testing.T) {
+	yamlContent := `
+target:
+  model_name: "single-model"
+  policy: "round_robin"
+  worker_urls:
+    - "http://192.168.1.50:8000/"
+    - "http://192.168.1.51:8000, http://192.168.1.50:8000"
+models:
+  - model_name: "manual-qwen"
+    mode: "run"
+    policy: "power_of_two"
+    worker_urls:
+      - "http://10.0.0.10:8000"
+      - "http://10.0.0.11:8000/"
+`
+	tmpFile := filepath.Join(t.TempDir(), "config.yaml")
+	if err := os.WriteFile(tmpFile, []byte(yamlContent), 0644); err != nil {
+		t.Fatalf("failed to write temp file: %v", err)
+	}
+
+	cfg, err := LoadConfig(tmpFile)
+	if err != nil {
+		t.Fatalf("LoadConfig failed: %v", err)
+	}
+
+	normTarget := NormalizeWorkerURLs(cfg.Target.WorkerURLs)
+	if len(normTarget) != 2 || normTarget[0] != "http://192.168.1.50:8000" || normTarget[1] != "http://192.168.1.51:8000" {
+		t.Errorf("unexpected normalized target worker_urls: %v", normTarget)
+	}
+
+	if len(cfg.Models) != 1 {
+		t.Fatalf("expected 1 model rule, got %d", len(cfg.Models))
+	}
+	normModel := NormalizeWorkerURLs(cfg.Models[0].WorkerURLs)
+	if len(normModel) != 2 || normModel[0] != "http://10.0.0.10:8000" || normModel[1] != "http://10.0.0.11:8000" {
+		t.Errorf("unexpected normalized model worker_urls: %v", normModel)
+	}
+
+	// Verify round-trip SaveConfig and LoadConfig
+	if err := SaveConfig(tmpFile, cfg); err != nil {
+		t.Fatalf("SaveConfig failed: %v", err)
+	}
+	reloaded, err := LoadConfig(tmpFile)
+	if err != nil {
+		t.Fatalf("LoadConfig after SaveConfig failed: %v", err)
+	}
+	if len(reloaded.Target.WorkerURLs) != 2 || len(reloaded.Models[0].WorkerURLs) != 2 {
+		t.Errorf("round-trip lost worker_urls: target=%v model=%v", reloaded.Target.WorkerURLs, reloaded.Models[0].WorkerURLs)
+	}
+}
+
+

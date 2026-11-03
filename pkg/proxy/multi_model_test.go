@@ -481,5 +481,65 @@ func TestProxyCallLoggingAndErrorSnapshot(t *testing.T) {
 	}
 }
 
+func TestProxy_ManualAndHybridWorkers(t *testing.T) {
+	worker1 := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		w.WriteHeader(http.StatusOK)
+		_, _ = w.Write([]byte(`{"choices":[{"message":{"content":"proxy_manual_1"}}]}`))
+	}))
+	defer worker1.Close()
+
+	worker2 := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		w.WriteHeader(http.StatusOK)
+		_, _ = w.Write([]byte(`{"choices":[{"message":{"content":"proxy_manual_2"}}]}`))
+	}))
+	defer worker2.Close()
+
+	tmpCfg := t.TempDir() + "/config.yaml"
+	srv := NewServer(ServerConfig{
+		Policy:           router.PolicyRoundRobin,
+		ModelName:        "manual-single",
+		StaticWorkerURLs: []string{worker1.URL},
+		ConfigFilePath:   tmpCfg,
+	}, nil)
+
+	// Merge GPUStack (empty) with manual StaticWorkerURLs
+	eps := srv.mergeSingleModelWithManual("manual-single", nil)
+	if len(eps) != 1 || eps[0].URL != worker1.URL {
+		t.Fatalf("expected 1 manual endpoint %s, got %+v", worker1.URL, eps)
+	}
+	srv.updateSingleModelEndpoints("manual-single", eps)
+
+	req1 := httptest.NewRequest(http.MethodPost, "http://localhost:8000/v1/chat/completions", strings.NewReader(`{"model":"manual-single"}`))
+	rec1 := httptest.NewRecorder()
+	srv.reverseProxy.ServeHTTP(rec1, req1)
+	if rec1.Code != http.StatusOK || !strings.Contains(rec1.Body.String(), "proxy_manual_1") {
+		t.Fatalf("expected 200 proxy_manual_1, got status=%d body=%s", rec1.Code, rec1.Body.String())
+	}
+
+	// Dynamically add a new model pool via UpdateModelRule
+	snap, err := srv.UpdateModelRule(context.Background(), dashboard.ModelRuleUpdateRequest{
+		ModelName:  "dynamic-manual-model",
+		Mode:       "proxy",
+		Policy:     "round_robin",
+		WorkerURLs: []string{worker2.URL},
+	})
+	if err != nil {
+		t.Fatalf("UpdateModelRule failed: %v", err)
+	}
+	if len(snap.Models) < 1 {
+		t.Fatalf("expected dynamic-manual-model in ConfigSnapshot, got %+v", snap.Models)
+	}
+
+	req2 := httptest.NewRequest(http.MethodPost, "http://localhost:8000/v1/chat/completions", strings.NewReader(`{"model":"dynamic-manual-model"}`))
+	rec2 := httptest.NewRecorder()
+	srv.reverseProxy.ServeHTTP(rec2, req2)
+	if rec2.Code != http.StatusOK || !strings.Contains(rec2.Body.String(), "proxy_manual_2") {
+		t.Fatalf("expected 200 proxy_manual_2, got status=%d body=%s", rec2.Code, rec2.Body.String())
+	}
+}
+
+
 
 

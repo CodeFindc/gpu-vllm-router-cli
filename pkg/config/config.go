@@ -3,6 +3,7 @@ package config
 import (
 	"fmt"
 	"os"
+	"strings"
 	"time"
 
 	"gopkg.in/yaml.v3"
@@ -19,8 +20,9 @@ type GPUStackConfig struct {
 
 // TargetConfig holds settings for the model to be routed.
 type TargetConfig struct {
-	ModelName string `yaml:"model_name"`
-	Policy    string `yaml:"policy"`
+	ModelName  string   `yaml:"model_name"`
+	Policy     string   `yaml:"policy"`
+	WorkerURLs []string `yaml:"worker_urls,omitempty" json:"worker_urls,omitempty"`
 }
 
 // RouterConfig holds settings for the router service.
@@ -111,11 +113,34 @@ type ModelRule struct {
 	ModelName           string   `yaml:"model_name" json:"model_name"`
 	Mode                string   `yaml:"mode,omitempty" json:"mode,omitempty"`     // "proxy" or "run" (empty = inherit global)
 	Policy              string   `yaml:"policy,omitempty" json:"policy,omitempty"` // "consistent_hash", etc. (empty = inherit global)
+	WorkerURLs          []string `yaml:"worker_urls,omitempty" json:"worker_urls,omitempty"`
 	BalanceAbsThreshold *int     `yaml:"balance_abs_threshold,omitempty" json:"balance_abs_threshold,omitempty"`
 	BalanceRelThreshold *float64 `yaml:"balance_rel_threshold,omitempty" json:"balance_rel_threshold,omitempty"`
 	CacheThreshold      *float64 `yaml:"cache_threshold,omitempty" json:"cache_threshold,omitempty"`
 	LogDir              string   `yaml:"log_dir,omitempty" json:"log_dir,omitempty"`
 	ExtraArgs           []string `yaml:"extra_args,omitempty" json:"extra_args,omitempty"`
+}
+
+// NormalizeWorkerURLs splits comma-separated entries, trims whitespace and trailing slashes,
+// and returns a deduplicated slice of non-empty URLs while preserving order.
+func NormalizeWorkerURLs(urls []string) []string {
+	seen := make(map[string]struct{}, len(urls))
+	var out []string
+	for _, raw := range urls {
+		parts := strings.Split(raw, ",")
+		for _, part := range parts {
+			u := strings.TrimSpace(part)
+			u = strings.TrimRight(u, "/")
+			if u == "" {
+				continue
+			}
+			if _, exists := seen[u]; !exists {
+				seen[u] = struct{}{}
+				out = append(out, u)
+			}
+		}
+	}
+	return out
 }
 
 // FileConfig represents the full structure of config.yaml.

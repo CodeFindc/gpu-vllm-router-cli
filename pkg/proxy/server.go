@@ -34,7 +34,8 @@ type ServerConfig struct {
 	Port                int
 	MetricsPort         int
 	Policy              router.Policy
-	ModelName           string // If empty, operates in full-cluster multi-model mode
+	ModelName           string   // If empty, operates in full-cluster multi-model mode
+	StaticWorkerURLs    []string // Optional manual static worker URLs (from target.worker_urls or --worker-urls)
 	WatchInterval       time.Duration
 	CircuitBreaker      CircuitBreakerConfig
 	ConfigFilePath      string
@@ -234,8 +235,10 @@ func NewServer(cfg ServerConfig, client *gpustack.Client) *Server {
 
 	rulesMap := make(map[string]config.ModelRule)
 	for _, r := range cfg.ModelRules {
+		r.WorkerURLs = config.NormalizeWorkerURLs(r.WorkerURLs)
 		rulesMap[r.ModelName] = r
 	}
+	cfg.StaticWorkerURLs = config.NormalizeWorkerURLs(cfg.StaticWorkerURLs)
 
 	s := &Server{
 		cfg:            cfg,
@@ -606,34 +609,52 @@ func (s *Server) errorHandler(w http.ResponseWriter, req *http.Request, err erro
 
 // Start boots the proxy server and watches GPUStack instances.
 func (s *Server) Start(ctx context.Context) error {
-	// Initial endpoint discovery
-	if s.client != nil {
-		if s.cfg.ModelName != "" {
-			// Single Model Mode
-			endpoints, model, err := s.client.GetRunningWorkerEndpoints(ctx, s.cfg.ModelName)
+	// Initial endpoint discovery (supports GPUStack, Manual, or Hybrid)
+	if s.cfg.ModelName != "" {
+		var gpuEps []gpustack.WorkerEndpoint
+		var modelID int
+		if s.client != nil {
+			eps, model, err := s.client.GetRunningWorkerEndpoints(ctx, s.cfg.ModelName)
 			if err != nil {
-				log.Printf("[Proxy] ⚠️ Initial discovery warning for model %q: %v. Entering STANDBY mode...", s.cfg.ModelName, err)
-			} else if len(endpoints) == 0 {
-				log.Printf("[Proxy] ⚠️ Warning: no running instances found for model %q in GPUStack at startup. Entering STANDBY mode...", s.cfg.ModelName)
+				log.Printf("[Proxy] ⚠️ Initial discovery warning for model %q: %v.", s.cfg.ModelName, err)
 			} else {
-				log.Printf("[Proxy] Discovered %d running instance(s) for model %s (ID: %d):", len(endpoints), model.Name, model.ID)
-				s.updateSingleModelEndpoints(s.cfg.ModelName, endpoints)
+				gpuEps = eps
+				if model != nil {
+					modelID = model.ID
+				}
 			}
 		} else {
-			// Full Cluster Multi-Model Mode
-			cluster, err := s.client.GetAllRunningWorkerEndpoints(ctx)
-			if err != nil {
-				log.Printf("[Proxy] ⚠️ Cluster-wide model discovery warning: %v. Entering STANDBY mode...", err)
-			} else if cluster == nil || cluster.InstanceCount == 0 {
-				log.Printf("[Proxy] ⚠️ Warning: no running model instances found across entire GPUStack cluster at startup. Entering STANDBY mode...")
-			} else {
-				log.Printf("[Proxy] [Multi-Model] Discovered %d active model(s) and %d running instance(s) in cluster:",
-					cluster.ModelCount, cluster.InstanceCount)
-				s.updateClusterEndpoints(cluster)
-			}
+			log.Printf("[Proxy] Running in standalone manual mode without GPUStack client for model %q.", s.cfg.ModelName)
+		}
+
+		endpoints := s.mergeSingleModelWithManual(s.cfg.ModelName, gpuEps)
+		if len(endpoints) == 0 {
+			log.Printf("[Proxy] ⚠️ Warning: no running instances found for model %q (GPUStack or manual config) at startup. Entering STANDBY mode...", s.cfg.ModelName)
+		} else {
+			log.Printf("[Proxy] Active %d instance(s) for model %s (ID: %d):", len(endpoints), s.cfg.ModelName, modelID)
+			s.updateSingleModelEndpoints(s.cfg.ModelName, endpoints)
 		}
 	} else {
-		log.Printf("[Proxy] Standby mode: running without active GPUStack client.")
+		var cluster *gpustack.ClusterEndpoints
+		if s.client != nil {
+			c, err := s.client.GetAllRunningWorkerEndpoints(ctx)
+			if err != nil {
+				log.Printf("[Proxy] ⚠️ Cluster-wide model discovery warning: %v.", err)
+			} else {
+				cluster = c
+			}
+		} else {
+			log.Printf("[Proxy] Running in standalone manual mode without GPUStack client.")
+		}
+
+		mergedCluster := s.mergeClusterWithManual(cluster)
+		if mergedCluster.InstanceCount == 0 {
+			log.Printf("[Proxy] ⚠️ Warning: no running model instances found across cluster or manual config at startup. Entering STANDBY mode...")
+		} else {
+			log.Printf("[Proxy] [Multi-Model] Active %d model(s) and %d instance(s) in cluster:",
+				mergedCluster.ModelCount, mergedCluster.InstanceCount)
+			s.updateClusterEndpoints(mergedCluster)
+		}
 	}
 
 	// Setup HTTP handler multiplexer
@@ -755,6 +776,123 @@ func (s *Server) recordEndpointsMeta(endpoints []gpustack.WorkerEndpoint) {
 	for _, ep := range endpoints {
 		s.endpointsMeta[ep.URL] = ep
 	}
+}
+
+func buildManualEndpoints(modelName string, rawURLs []string) []gpustack.WorkerEndpoint {
+	norm := config.NormalizeWorkerURLs(rawURLs)
+	var eps []gpustack.WorkerEndpoint
+	for _, u := range norm {
+		hostPort := u
+		if parsed, err := url.Parse(u); err == nil && parsed.Host != "" {
+			hostPort = parsed.Host
+		}
+		eps = append(eps, gpustack.WorkerEndpoint{
+			ModelName:    modelName,
+			InstanceName: "manual-" + hostPort,
+			WorkerName:   "manual-static",
+			URL:          u,
+		})
+	}
+	return eps
+}
+
+func mergeEndpoints(gpuEps, manualEps []gpustack.WorkerEndpoint) []gpustack.WorkerEndpoint {
+	seen := make(map[string]struct{}, len(gpuEps)+len(manualEps))
+	var out []gpustack.WorkerEndpoint
+	for _, ep := range gpuEps {
+		u := strings.TrimRight(strings.TrimSpace(ep.URL), "/")
+		if u == "" {
+			continue
+		}
+		ep.URL = u
+		if _, ok := seen[u]; !ok {
+			seen[u] = struct{}{}
+			out = append(out, ep)
+		}
+	}
+	for _, ep := range manualEps {
+		u := strings.TrimRight(strings.TrimSpace(ep.URL), "/")
+		if u == "" {
+			continue
+		}
+		ep.URL = u
+		if _, ok := seen[u]; !ok {
+			seen[u] = struct{}{}
+			out = append(out, ep)
+		}
+	}
+	return out
+}
+
+func (s *Server) getManualEndpointsForModelLocked(modelName string) []gpustack.WorkerEndpoint {
+	var raw []string
+	if s.cfg.ModelName == modelName || (s.cfg.ModelName == "" && modelName == "default") {
+		raw = append(raw, s.cfg.StaticWorkerURLs...)
+	}
+	if rule, ok := s.modelRules[modelName]; ok && len(rule.WorkerURLs) > 0 {
+		raw = append(raw, rule.WorkerURLs...)
+	}
+	return buildManualEndpoints(modelName, raw)
+}
+
+func (s *Server) getAllManualModelsEndpointsLocked() map[string][]gpustack.WorkerEndpoint {
+	res := make(map[string][]gpustack.WorkerEndpoint)
+	if len(s.cfg.StaticWorkerURLs) > 0 {
+		targetModel := s.cfg.ModelName
+		if targetModel == "" {
+			targetModel = "default"
+		}
+		res[targetModel] = buildManualEndpoints(targetModel, s.cfg.StaticWorkerURLs)
+	}
+	for mName, rule := range s.modelRules {
+		if len(rule.WorkerURLs) > 0 {
+			manEps := buildManualEndpoints(mName, rule.WorkerURLs)
+			res[mName] = mergeEndpoints(res[mName], manEps)
+		}
+	}
+	return res
+}
+
+func (s *Server) mergeSingleModelWithManual(modelName string, gpuEps []gpustack.WorkerEndpoint) []gpustack.WorkerEndpoint {
+	s.mu.RLock()
+	manualEps := s.getManualEndpointsForModelLocked(modelName)
+	s.mu.RUnlock()
+	return mergeEndpoints(gpuEps, manualEps)
+}
+
+func (s *Server) mergeClusterWithManual(cluster *gpustack.ClusterEndpoints) *gpustack.ClusterEndpoints {
+	out := &gpustack.ClusterEndpoints{
+		Models:          make(map[string]gpustack.ModelPublic),
+		ModelsEndpoints: make(map[string][]gpustack.WorkerEndpoint),
+	}
+	if cluster != nil {
+		for k, v := range cluster.Models {
+			out.Models[k] = v
+		}
+		for k, eps := range cluster.ModelsEndpoints {
+			out.ModelsEndpoints[k] = eps
+		}
+	}
+
+	s.mu.RLock()
+	manualModels := s.getAllManualModelsEndpointsLocked()
+	s.mu.RUnlock()
+
+	for mName, manEps := range manualModels {
+		out.ModelsEndpoints[mName] = mergeEndpoints(out.ModelsEndpoints[mName], manEps)
+		if _, exists := out.Models[mName]; !exists {
+			out.Models[mName] = gpustack.ModelPublic{Name: mName}
+		}
+	}
+
+	for _, eps := range out.ModelsEndpoints {
+		if len(eps) > 0 {
+			out.ModelCount++
+			out.InstanceCount += len(eps)
+			out.AllEndpoints = append(out.AllEndpoints, eps...)
+		}
+	}
+	return out
 }
 
 func (s *Server) pruneEndpointsMeta(activeURLs []string) {
@@ -1008,12 +1146,13 @@ func (s *Server) watchLoop(ctx context.Context) {
 			return
 		case <-ticker.C:
 			if s.cfg.ModelName != "" {
-				// Single model refresh
-				endpoints, _, err := s.client.GetRunningWorkerEndpoints(ctx, s.cfg.ModelName)
+				// Single model refresh (merge GPUStack + manual endpoints)
+				gpuEps, _, err := s.client.GetRunningWorkerEndpoints(ctx, s.cfg.ModelName)
 				if err != nil {
 					log.Printf("[Proxy] Warning: failed to refresh instances: %v", err)
 					continue
 				}
+				endpoints := s.mergeSingleModelWithManual(s.cfg.ModelName, gpuEps)
 				var newURLs []string
 				for _, ep := range endpoints {
 					newURLs = append(newURLs, ep.URL)
@@ -1029,15 +1168,16 @@ func (s *Server) watchLoop(ctx context.Context) {
 					s.updateSingleModelEndpoints(s.cfg.ModelName, endpoints)
 				}
 			} else {
-				// Cluster-wide all models refresh
+				// Cluster-wide all models refresh (merge GPUStack + manual endpoints)
 				cluster, err := s.client.GetAllRunningWorkerEndpoints(ctx)
 				if err != nil {
 					log.Printf("[Proxy] Warning: failed to refresh cluster models: %v", err)
 					continue
 				}
 
+				mergedCluster := s.mergeClusterWithManual(cluster)
 				var newURLs []string
-				for _, ep := range cluster.AllEndpoints {
+				for _, ep := range mergedCluster.AllEndpoints {
 					newURLs = append(newURLs, ep.URL)
 				}
 				sort.Strings(newURLs)
@@ -1050,7 +1190,7 @@ func (s *Server) watchLoop(ctx context.Context) {
 					log.Printf("[Proxy] Cluster-wide instances or models changed! Updating routing table...")
 					log.Printf("  Previous URLs: %v", currentURLs)
 					log.Printf("  New URLs:      %v", newURLs)
-					s.updateClusterEndpoints(cluster)
+					s.updateClusterEndpoints(mergedCluster)
 				}
 			}
 		}
@@ -1497,10 +1637,17 @@ func (s *Server) UpdateConfig(ctx context.Context, req dashboard.ConfigUpdateReq
 
 	if req.Models != nil {
 		for _, m := range req.Models {
+			workerURLs := config.NormalizeWorkerURLs(m.WorkerURLs)
+			if m.WorkerURLs == nil {
+				if prev, ok := s.modelRules[m.ModelName]; ok {
+					workerURLs = prev.WorkerURLs
+				}
+			}
 			rule := config.ModelRule{
 				ModelName:           m.ModelName,
 				Mode:                m.Mode,
 				Policy:              m.Policy,
+				WorkerURLs:          workerURLs,
 				BalanceAbsThreshold: m.BalanceAbsThreshold,
 				BalanceRelThreshold: m.BalanceRelThreshold,
 				CacheThreshold:      m.CacheThreshold,
@@ -1520,10 +1667,18 @@ func (s *Server) UpdateModelRule(ctx context.Context, req dashboard.ModelRuleUpd
 	s.mu.Lock()
 	defer s.mu.Unlock()
 
+	workerURLs := config.NormalizeWorkerURLs(req.WorkerURLs)
+	if req.WorkerURLs == nil {
+		if prev, ok := s.modelRules[req.ModelName]; ok {
+			workerURLs = prev.WorkerURLs
+		}
+	}
+
 	rule := config.ModelRule{
 		ModelName:           req.ModelName,
 		Mode:                req.Mode,
 		Policy:              req.Policy,
+		WorkerURLs:          workerURLs,
 		BalanceAbsThreshold: req.BalanceAbsThreshold,
 		BalanceRelThreshold: req.BalanceRelThreshold,
 		CacheThreshold:      req.CacheThreshold,
@@ -1537,9 +1692,117 @@ func (s *Server) UpdateModelRule(ctx context.Context, req dashboard.ModelRuleUpd
 }
 
 func (s *Server) applyModelRuleLocked(ctx context.Context, rule config.ModelRule) {
+	manualEps := s.getManualEndpointsForModelLocked(rule.ModelName)
+	if len(manualEps) > 0 {
+		s.recordEndpointsMeta(manualEps)
+	}
+
 	pool, ok := s.modelPools[rule.ModelName]
 	if !ok || pool == nil {
+		if len(manualEps) == 0 {
+			return
+		}
+		var targets []*BackendTarget
+		for _, ep := range manualEps {
+			u, err := url.Parse(ep.URL)
+			if err != nil {
+				continue
+			}
+			existing := s.findExistingTarget(ep.URL)
+			var cb *CircuitBreaker
+			if existing != nil && existing.CircuitBreaker != nil {
+				cb = existing.CircuitBreaker
+			} else {
+				cb = NewCircuitBreaker(ep.URL, s.cfg.CircuitBreaker)
+			}
+			t := &BackendTarget{
+				URL:            u,
+				URLString:      ep.URL,
+				Healthy:        true,
+				CircuitBreaker: cb,
+			}
+			targets = append(targets, t)
+			s.allTargets = append(s.allTargets, t)
+			s.activeURLs = append(s.activeURLs, ep.URL)
+		}
+		sort.Strings(s.activeURLs)
+
+		targetMode := rule.Mode
+		if targetMode == "" {
+			targetMode = "proxy"
+		}
+		targetPolicy := s.cfg.Policy
+		if rule.Policy != "" {
+			if p, err := router.ParsePolicy(rule.Policy); err == nil {
+				targetPolicy = p
+			}
+		}
+
+		pool = &ModelPool{
+			ModelName:           rule.ModelName,
+			Mode:                targetMode,
+			Policy:              targetPolicy,
+			Balancer:            NewBalancer(targetPolicy, targets),
+			Targets:             targets,
+			BalanceAbsThreshold: rule.BalanceAbsThreshold,
+			BalanceRelThreshold: rule.BalanceRelThreshold,
+			CacheThreshold:      rule.CacheThreshold,
+			ExtraArgs:           rule.ExtraArgs,
+		}
+		s.modelPools[rule.ModelName] = pool
+		s.modelsList = append(s.modelsList, gpustack.ModelPublic{Name: rule.ModelName})
+
+		if targetMode == "run" && len(pool.Targets) > 0 {
+			var urls []string
+			for _, t := range pool.Targets {
+				urls = append(urls, t.URLString)
+			}
+			go func(p *ModelPool, u []string) {
+				_ = s.startRunnerForPool(p, u)
+			}(pool, urls)
+		}
 		return
+	}
+
+	// Merge any existing GPUStack endpoints for this pool with updated manual endpoints
+	if len(manualEps) > 0 {
+		var gpuEps []gpustack.WorkerEndpoint
+		s.endpointsMu.RLock()
+		for _, t := range pool.Targets {
+			if meta, exists := s.endpointsMeta[t.URLString]; exists && meta.WorkerName != "manual-static" {
+				gpuEps = append(gpuEps, meta)
+			}
+		}
+		s.endpointsMu.RUnlock()
+
+		mergedEps := mergeEndpoints(gpuEps, manualEps)
+		var newTargets []*BackendTarget
+		for _, ep := range mergedEps {
+			u, err := url.Parse(ep.URL)
+			if err != nil {
+				continue
+			}
+			existing := s.findExistingTarget(ep.URL)
+			var cb *CircuitBreaker
+			if existing != nil && existing.CircuitBreaker != nil {
+				cb = existing.CircuitBreaker
+			} else {
+				cb = NewCircuitBreaker(ep.URL, s.cfg.CircuitBreaker)
+			}
+			t := &BackendTarget{
+				URL:            u,
+				URLString:      ep.URL,
+				Healthy:        true,
+				CircuitBreaker: cb,
+			}
+			newTargets = append(newTargets, t)
+			if existing == nil {
+				s.allTargets = append(s.allTargets, t)
+				s.activeURLs = append(s.activeURLs, ep.URL)
+			}
+		}
+		sort.Strings(s.activeURLs)
+		pool.Targets = newTargets
 	}
 
 	targetMode := rule.Mode
@@ -1725,8 +1988,9 @@ func (s *Server) saveConfigToFileLocked() error {
 			ExtraArgs:           s.cfg.ExtraArgs,
 		},
 		Target: config.TargetConfig{
-			ModelName: s.cfg.ModelName,
-			Policy:    string(s.cfg.Policy),
+			ModelName:  s.cfg.ModelName,
+			Policy:     string(s.cfg.Policy),
+			WorkerURLs: s.cfg.StaticWorkerURLs,
 		},
 		CircuitBreaker: config.CircuitBreakerConfig{
 			Enabled:             &cbEnabled,
@@ -1753,6 +2017,7 @@ func (s *Server) getConfigLocked() *dashboard.ConfigSnapshot {
 			ModelName:           mName,
 			Mode:                r.Mode,
 			Policy:              r.Policy,
+			WorkerURLs:          r.WorkerURLs,
 			BalanceAbsThreshold: r.BalanceAbsThreshold,
 			BalanceRelThreshold: r.BalanceRelThreshold,
 			CacheThreshold:      r.CacheThreshold,

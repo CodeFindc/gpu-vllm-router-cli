@@ -35,6 +35,11 @@ target:
   # - rendezvous_hash: 最高随机权重哈希 (HRW)，节点增删时节点迁移量最小，缓存抖动最小
   policy: "consistent_hash"
 
+  # 手动添加的静态 Worker 实例地址列表 (可选，支持纯手动脱离 GPUStack 独立运行，或与 GPUStack 动态实例混合去重合并):
+  # worker_urls:
+  #   - "http://192.168.1.50:8000"
+  #   - "http://192.168.1.51:8000"
+
 # ------------------------------------------------------------------------------
 # 3. 核心路由器服务与运行环境配置
 # ------------------------------------------------------------------------------
@@ -203,10 +208,13 @@ circuit_breaker:
 #     balance_abs_threshold: 32
 #     balance_rel_threshold: 1.2
 #
-#   # 示例 2: 短推理 / 吞吐模型，使用 P2C 负载敏感轮询，由官方 run 守护进程托管
+#   # 示例 2: 短推理 / 吞吐模型，使用 P2C 负载敏感轮询，由官方 run 守护进程托管，并手动追加静态实例
 #   - model_name: "Qwen3.6-27B"
 #     mode: "run"
 #     policy: "power_of_two"
+#     worker_urls:
+#       - "http://192.168.1.60:8000"
+#       - "http://192.168.1.61:8000"
 #     extra_args:
 #       - "--worker-startup-timeout-secs"
 #       - "300"

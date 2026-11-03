@@ -67,6 +67,7 @@ type ModelRuleDTO struct {
 	ModelName           string   `json:"model_name"`
 	Mode                string   `json:"mode,omitempty"`   // "proxy", "run" or "" (inherit)
 	Policy              string   `json:"policy,omitempty"` // "consistent_hash", etc. or "" (inherit)
+	WorkerURLs          []string `json:"worker_urls,omitempty"`
 	BalanceAbsThreshold *int     `json:"balance_abs_threshold,omitempty"`
 	BalanceRelThreshold *float64 `json:"balance_rel_threshold,omitempty"`
 	CacheThreshold      *float64 `json:"cache_threshold,omitempty"`
@@ -121,6 +122,7 @@ type ModelRuleUpdateRequest struct {
 	ModelName           string   `json:"model_name"`
 	Mode                string   `json:"mode"`   // "proxy", "run", or "" (reset to inherit)
 	Policy              string   `json:"policy"` // "consistent_hash", etc. or "" (reset to inherit)
+	WorkerURLs          []string `json:"worker_urls,omitempty"`
 	BalanceAbsThreshold *int     `json:"balance_abs_threshold,omitempty"`
 	BalanceRelThreshold *float64 `json:"balance_rel_threshold,omitempty"`
 	CacheThreshold      *float64 `json:"cache_threshold,omitempty"`
