@@ -5,6 +5,8 @@ import (
 	"fmt"
 	"net/http"
 	"strings"
+
+	"gpu-vllm-router/pkg/logger"
 )
 
 // Handler serves the web dashboard UI and related topology/probe APIs.
@@ -136,6 +138,11 @@ func (h *Handler) handleProbe(w http.ResponseWriter, r *http.Request) {
 		Success: ok && err == nil,
 		Message: msg,
 	}
+	if resp.Success {
+		logger.Infof("[Admin:API] 🔍 手动健康探测成功 | Client: %s | Worker: %s", logger.ExtractClientIP(r), targetURL)
+	} else {
+		logger.Warnf("[Admin:API] ⚠️ 手动健康探测失败 | Client: %s | Worker: %s | Reason: %s", logger.ExtractClientIP(r), targetURL, msg)
+	}
 
 	w.WriteHeader(http.StatusOK)
 	_ = json.NewEncoder(w).Encode(resp)
@@ -181,6 +188,11 @@ func (h *Handler) handleResetBreaker(w http.ResponseWriter, r *http.Request) {
 		Success: err == nil,
 		Message: msg,
 	}
+	if resp.Success {
+		logger.Infof("[Admin:API] 🔄 手动重置熔断器成功 | Client: %s | Worker: %s -> CLOSED", logger.ExtractClientIP(r), targetURL)
+	} else {
+		logger.Warnf("[Admin:API] ⚠️ 手动重置熔断器失败 | Client: %s | Worker: %s | Error: %s", logger.ExtractClientIP(r), targetURL, msg)
+	}
 
 	w.WriteHeader(http.StatusOK)
 	_ = json.NewEncoder(w).Encode(resp)
@@ -224,10 +236,14 @@ func (h *Handler) handleUpdateConfig(w http.ResponseWriter, r *http.Request) {
 
 	updated, err := mgr.UpdateConfig(r.Context(), req)
 	if err != nil {
+		logger.Warnf("[Admin:API] ⚠️ 全局配置热更新失败 | Client: %s | Error: %v", logger.ExtractClientIP(r), err)
 		w.WriteHeader(http.StatusBadRequest)
 		_ = json.NewEncoder(w).Encode(ConfigUpdateResponse{Success: false, Message: err.Error()})
 		return
 	}
+
+	logger.Infof("[Admin:API] ⚙️ 全局配置已热更新 | Client: %s | Mode: %s | Policy: %s",
+		logger.ExtractClientIP(r), updated.Mode, updated.Policy)
 
 	w.WriteHeader(http.StatusOK)
 	_ = json.NewEncoder(w).Encode(ConfigUpdateResponse{
@@ -259,10 +275,15 @@ func (h *Handler) handleUpdateModelRule(w http.ResponseWriter, r *http.Request) 
 
 	updated, err := mgr.UpdateModelRule(r.Context(), req)
 	if err != nil {
+		logger.Warnf("[Admin:API] ⚠️ 模型路由规则更新失败 | Client: %s | Model: %q | Error: %v",
+			logger.ExtractClientIP(r), req.ModelName, err)
 		w.WriteHeader(http.StatusBadRequest)
 		_ = json.NewEncoder(w).Encode(ConfigUpdateResponse{Success: false, Message: err.Error()})
 		return
 	}
+
+	logger.Infof("[Admin:API] ⚙️ 模型路由规则已热更新 | Client: %s | Model: %q | Mode: %q | Policy: %q",
+		logger.ExtractClientIP(r), req.ModelName, req.Mode, req.Policy)
 
 	w.WriteHeader(http.StatusOK)
 	_ = json.NewEncoder(w).Encode(ConfigUpdateResponse{

@@ -17,6 +17,7 @@ import (
 
 	"gpu-vllm-router/pkg/config"
 	"gpu-vllm-router/pkg/dashboard"
+	"gpu-vllm-router/pkg/logger"
 )
 
 func TestGetFreePort(t *testing.T) {
@@ -555,5 +556,64 @@ func TestSupervisor_TransportKeepAliveAcrossReload(t *testing.T) {
 	// 3. Verify clean shutdown and CloseIdleConnections
 	sup.Stop()
 }
+
+func TestSupervisorCallLogging(t *testing.T) {
+	var logBuf bytes.Buffer
+	origLevel := logger.GetLevel()
+	logger.SetOutput(&logBuf)
+	logger.SetLevel(logger.LevelInfo)
+	defer func() {
+		logger.SetOutput(os.Stderr)
+		logger.SetLevel(origLevel)
+	}()
+
+	backend := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		w.Header().Set("X-Vllm-Router-Worker", "http://192.168.1.20:8000")
+		w.WriteHeader(http.StatusOK)
+		_, _ = w.Write([]byte(`{"choices":[{"message":{"content":"hello from supervisor"}}]}`))
+	}))
+	defer backend.Close()
+
+	targetURL, _ := url.Parse(backend.URL)
+	sup := &Supervisor{
+		runners: map[string]*ModelRunner{
+			"Qwen3.6-27B": {
+				ModelName:    "Qwen3.6-27B",
+				Mode:         "run",
+				Policy:       PolicyCacheAware,
+				ActiveTarget: targetURL,
+				ActiveURLs:   []string{"http://192.168.1.20:8000"},
+			},
+		},
+		workerStates: make(map[string]*WorkerBreaker),
+	}
+
+	req := httptest.NewRequest(http.MethodPost, "/v1/chat/completions", strings.NewReader(`{"model":"Qwen3.6-27B","stream":true,"messages":[{"role":"user","content":"hi"}]}`))
+	req.Header.Set("X-Request-ID", "sup-trace-101")
+	rw := httptest.NewRecorder()
+
+	sup.handleProxy(rw, req)
+
+	if rw.Code != http.StatusOK {
+		t.Fatalf("expected 200 OK, got %d", rw.Code)
+	}
+	if rw.Header().Get("X-Request-ID") != "sup-trace-101" {
+		t.Errorf("expected response header X-Request-ID=sup-trace-101, got %q", rw.Header().Get("X-Request-ID"))
+	}
+
+	logs := logBuf.String()
+	for _, stage := range []string{
+		"[Call:RECV] [ReqID: sup-trace-101]",
+		"[Call:ROUTE] [ReqID: sup-trace-101]",
+		"[Call:RESP] [ReqID: sup-trace-101]",
+		"[Call:DONE] [ReqID: sup-trace-101]",
+	} {
+		if !strings.Contains(logs, stage) {
+			t.Errorf("expected supervisor logs to contain %q, got:\n%s", stage, logs)
+		}
+	}
+}
+
 
 

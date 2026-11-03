@@ -266,28 +266,59 @@ func getFreePort() (int, error) {
 
 // inspectModelFromRequest peeks at the incoming request to determine the target model name.
 func inspectModelFromRequest(req *http.Request) (string, []byte) {
+	model, _, _, bodyBytes := inspectRequestMeta(req)
+	return model, bodyBytes
+}
+
+// inspectRequestMeta extracts model, stream flag, session key, and raw body bytes from the request.
+func inspectRequestMeta(req *http.Request) (model string, stream bool, sessionKey string, bodyBytes []byte) {
+	if req == nil {
+		return "", false, "", nil
+	}
 	if m := req.URL.Query().Get("model"); m != "" {
-		return m, nil
+		model = m
 	}
 
 	if req.Body != nil && (req.Method == http.MethodPost || req.Method == http.MethodPut) {
-		bodyBytes, err := io.ReadAll(req.Body)
+		b, err := io.ReadAll(req.Body)
 		if err == nil {
+			bodyBytes = b
 			req.Body = io.NopCloser(bytes.NewReader(bodyBytes))
 			req.GetBody = func() (io.ReadCloser, error) {
 				return io.NopCloser(bytes.NewReader(bodyBytes)), nil
 			}
 
-			var peek struct {
-				Model string `json:"model"`
+			if len(bodyBytes) > 0 {
+				var peek struct {
+					Model  string `json:"model"`
+					Stream bool   `json:"stream"`
+					User   string `json:"user"`
+				}
+				if err := json.Unmarshal(bodyBytes, &peek); err == nil {
+					if model == "" && peek.Model != "" {
+						model = peek.Model
+					}
+					stream = peek.Stream
+					if peek.User != "" {
+						sessionKey = peek.User
+					}
+				}
 			}
-			if err := json.Unmarshal(bodyBytes, &peek); err == nil && peek.Model != "" {
-				return peek.Model, bodyBytes
-			}
-			return "", bodyBytes
 		}
 	}
-	return "", nil
+
+	if sessionKey == "" {
+		for _, h := range []string{"X-Session-ID", "X-User-ID", "X-Tenant-ID", "X-Request-ID"} {
+			if val := req.Header.Get(h); val != "" {
+				sessionKey = val
+				break
+			}
+		}
+	}
+	if sessionKey == "" {
+		sessionKey = req.RemoteAddr
+	}
+	return model, stream, sessionKey, bodyBytes
 }
 
 // findRunner matches the requested model name against active model runners.
@@ -613,6 +644,7 @@ func (s *Supervisor) handleModels(w http.ResponseWriter, r *http.Request) {
 		"object": "list",
 		"data":   modelCards,
 	}
+	logger.Infof("[Supervisor:API] 📋 GET /v1/models | Client: %s | ReturnedModels: %d", logger.ExtractClientIP(r), len(modelCards))
 	w.Header().Set("Content-Type", "application/json")
 	_ = json.NewEncoder(w).Encode(resp)
 }
@@ -807,17 +839,28 @@ func (s *Supervisor) handleProxy(w http.ResponseWriter, req *http.Request) {
 		return
 	}
 
-	modelName, _ := inspectModelFromRequest(req)
+	modelName, stream, sessionKey, bodyBytes := inspectRequestMeta(req)
+	trace := logger.NewCallTrace(req, modelName, stream, sessionKey, bodyBytes, "run")
+	if req.Header == nil {
+		req.Header = make(http.Header)
+	}
+	req.Header.Set("X-Request-ID", trace.ReqID)
+	w.Header().Set("X-Request-ID", trace.ReqID)
+	trace.LogRecv()
+
 	runner, err := s.findRunner(modelName)
 	if err != nil {
+		trace.LogRouteError(err)
+		trace.LogGatewayFail(http.StatusNotFound, err, req.Context().Err())
 		w.Header().Set("Content-Type", "application/json")
 		w.WriteHeader(http.StatusNotFound)
 		resp := map[string]interface{}{
 			"error": map[string]interface{}{
-				"message": fmt.Sprintf("The model %q does not exist or has no healthy backends in GPUStack cluster. Details: %v", modelName, err),
-				"type":    "invalid_request_error",
-				"param":   "model",
-				"code":    "model_not_found",
+				"message":    fmt.Sprintf("The model %q does not exist or has no healthy backends in GPUStack cluster. Details: %v", modelName, err),
+				"type":       "invalid_request_error",
+				"param":      "model",
+				"code":       "model_not_found",
+				"request_id": trace.ReqID,
 			},
 		}
 		_ = json.NewEncoder(w).Encode(resp)
@@ -832,9 +875,13 @@ func (s *Supervisor) handleProxy(w http.ResponseWriter, req *http.Request) {
 
 	if mode == "proxy" {
 		if len(activeURLs) == 0 {
+			noBackendErr := fmt.Errorf("no active backends for model %s", runner.ModelName)
+			trace.SetTarget(runner.ModelName, string(runner.Policy), "", "", "")
+			trace.LogRouteError(noBackendErr)
+			trace.LogGatewayFail(http.StatusBadGateway, noBackendErr, req.Context().Err())
 			w.Header().Set("Content-Type", "application/json")
 			w.WriteHeader(http.StatusBadGateway)
-			_, _ = w.Write([]byte(fmt.Sprintf(`{"error":{"message":"No active backends for model %s","type":"bad_gateway"}}`, runner.ModelName)))
+			_, _ = w.Write([]byte(fmt.Sprintf(`{"error":{"message":"No active backends for model %s","type":"bad_gateway","request_id":%q}}`, runner.ModelName, trace.ReqID)))
 			return
 		}
 
@@ -871,21 +918,19 @@ func (s *Supervisor) handleProxy(w http.ResponseWriter, req *http.Request) {
 		}()
 
 		s.endpointsMu.RLock()
-		epMeta, hasMeta := s.endpointsMeta[chosenURL]
+		epMeta := s.endpointsMeta[chosenURL]
 		s.endpointsMu.RUnlock()
-		instDesc := ""
-		if hasMeta && epMeta.WorkerName != "" {
-			instDesc = fmt.Sprintf(" (Worker: %s, Instance: %s)", epMeta.WorkerName, epMeta.InstanceName)
-		}
-		logger.Debugf("[Supervisor:Route] 🚀 [Model: %s] [DirectProxy] %s %s -> %s%s (ActiveConns: %d)",
-			runner.ModelName, req.Method, req.URL.Path, chosenURL, instDesc, atomic.LoadInt64(&runner.activeConns))
+
+		trace.SetTarget(runner.ModelName, string(runner.Policy), chosenURL, epMeta.WorkerName, epMeta.InstanceName)
+		trace.LogRoute(atomic.LoadInt64(&runner.activeConns), "direct_proxy")
 
 		destURL, parseErr := url.Parse(chosenURL)
 		if parseErr != nil {
 			atomic.AddInt64(&runner.activeConns, -1)
+			trace.LogGatewayFail(http.StatusBadGateway, parseErr, req.Context().Err())
 			w.Header().Set("Content-Type", "application/json")
 			w.WriteHeader(http.StatusBadGateway)
-			_, _ = w.Write([]byte(fmt.Sprintf(`{"error":{"message":"Invalid worker URL %q: %v","type":"bad_gateway"}}`, chosenURL, parseErr)))
+			_, _ = w.Write([]byte(fmt.Sprintf(`{"error":{"message":"Invalid worker URL %q: %v","type":"bad_gateway","request_id":%q}}`, chosenURL, parseErr, trace.ReqID)))
 			return
 		}
 
@@ -905,6 +950,7 @@ func (s *Supervisor) handleProxy(w http.ResponseWriter, req *http.Request) {
 			},
 			FlushInterval: 10 * time.Millisecond,
 			ModifyResponse: func(resp *http.Response) error {
+				resp.Header.Set("X-Request-ID", trace.ReqID)
 				s.workerMu.Lock()
 				if wb, ok := s.workerStates[chosenURL]; ok {
 					if resp.StatusCode < 500 {
@@ -914,6 +960,16 @@ func (s *Supervisor) handleProxy(w http.ResponseWriter, req *http.Request) {
 					}
 				}
 				s.workerMu.Unlock()
+
+				var errSnippet string
+				if resp.StatusCode >= 400 {
+					errSnippet = logger.PeekErrorResponseBody(resp, 1024)
+				}
+				trace.LogFirstByte(resp.StatusCode, resp.Header.Get("Content-Type"), errSnippet)
+				statusCode := resp.StatusCode
+				resp.Body = logger.WrapResponseBody(resp.Body, func(bytesRead int64, readErr error) {
+					trace.LogDone(statusCode, bytesRead, readErr, req.Context().Err())
+				})
 				return nil
 			},
 			ErrorHandler: func(rw http.ResponseWriter, r *http.Request, err error) {
@@ -923,12 +979,12 @@ func (s *Supervisor) handleProxy(w http.ResponseWriter, req *http.Request) {
 				}
 				s.workerMu.Unlock()
 				if errors.Is(err, context.Canceled) || errors.Is(r.Context().Err(), context.Canceled) {
-					log.Printf("[Supervisor:DirectProxy] Client canceled/disconnected request for model %s (Queue timeout or User abort)", runner.ModelName)
+					trace.LogGatewayFail(499, err, r.Context().Err())
 					return
 				}
-				log.Printf("[Supervisor:DirectProxy] Forwarding error for model %s to %s: %v", runner.ModelName, chosenURL, err)
+				trace.LogGatewayFail(http.StatusBadGateway, err, r.Context().Err())
 				rw.WriteHeader(http.StatusBadGateway)
-				_, _ = rw.Write([]byte(fmt.Sprintf(`{"error":{"message":"Router direct proxy error for model %s: %v","type":"bad_gateway"}}`, runner.ModelName, err)))
+				_, _ = rw.Write([]byte(fmt.Sprintf(`{"error":{"message":"Router direct proxy error for model %s: %v","type":"bad_gateway","request_id":%q}}`, runner.ModelName, err, trace.ReqID)))
 			},
 		}
 		proxy.ServeHTTP(w, req)
@@ -936,9 +992,13 @@ func (s *Supervisor) handleProxy(w http.ResponseWriter, req *http.Request) {
 	}
 
 	if target == nil {
+		initErr := fmt.Errorf("router process for model %s is initializing", runner.ModelName)
+		trace.SetTarget(runner.ModelName, string(runner.Policy), "", "", "")
+		trace.LogRouteError(initErr)
+		trace.LogGatewayFail(http.StatusServiceUnavailable, initErr, req.Context().Err())
 		w.Header().Set("Content-Type", "application/json")
 		w.WriteHeader(http.StatusServiceUnavailable)
-		w.Write([]byte(`{"error":{"message":"Router process for model is initializing, please retry shortly","type":"service_unavailable"}}`))
+		w.Write([]byte(fmt.Sprintf(`{"error":{"message":"Router process for model is initializing, please retry shortly","type":"service_unavailable","request_id":%q}}`, trace.ReqID)))
 		return
 	}
 
@@ -983,12 +1043,15 @@ func (s *Supervisor) handleProxy(w http.ResponseWriter, req *http.Request) {
 		Transport: s.getTransport(),
 		Director: func(r *http.Request) {
 			if len(activeURLs) == 1 {
-				logger.Debugf("[Supervisor:Route] 🚀 [Model: %s] [Policy: %s] %s %s -> Worker: %s (ActiveConns: %d)",
-					runner.ModelName, runner.Policy, r.Method, r.URL.Path, workersSummary, atomic.LoadInt64(&runner.activeConns))
+				s.endpointsMu.RLock()
+				meta := s.endpointsMeta[singleWorker]
+				s.endpointsMu.RUnlock()
+				trace.SetTarget(runner.ModelName, string(runner.Policy), singleWorker, meta.WorkerName, meta.InstanceName)
 			} else {
-				logger.Debugf("[Supervisor:Route] 🔀 [Model: %s] [Policy: %s] %s %s -> vllm-router (%s) | Workers: [%s] (ActiveConns: %d)",
-					runner.ModelName, runner.Policy, r.Method, r.URL.Path, target.String(), workersSummary, atomic.LoadInt64(&runner.activeConns))
+				trace.SetTarget(runner.ModelName, string(runner.Policy), fmt.Sprintf("vllm-router (%s)", target.String()), workersSummary, "")
 			}
+			trace.LogRoute(atomic.LoadInt64(&runner.activeConns), string(runner.Policy))
+
 			r.URL.Scheme = target.Scheme
 			r.URL.Host = target.Host
 			r.Host = target.Host
@@ -998,6 +1061,7 @@ func (s *Supervisor) handleProxy(w http.ResponseWriter, req *http.Request) {
 		},
 		FlushInterval: 10 * time.Millisecond,
 		ModifyResponse: func(resp *http.Response) error {
+			resp.Header.Set("X-Request-ID", trace.ReqID)
 			workerURL := resp.Header.Get("x-vllm-router-worker")
 			if workerURL == "" {
 				workerURL = resp.Header.Get("X-Vllm-Router-Worker")
@@ -1007,14 +1071,9 @@ func (s *Supervisor) handleProxy(w http.ResponseWriter, req *http.Request) {
 			}
 			if workerURL != "" {
 				s.endpointsMu.RLock()
-				meta, ok := s.endpointsMeta[workerURL]
+				meta := s.endpointsMeta[workerURL]
 				s.endpointsMu.RUnlock()
-				instDesc := ""
-				if ok && meta.WorkerName != "" {
-					instDesc = fmt.Sprintf(" (Worker: %s, Instance: %s)", meta.WorkerName, meta.InstanceName)
-				}
-				log.Printf("[Supervisor:Route] 🎯 [Model: %s] [Policy: %s] Real Worker: %s%s (Status: %d)",
-					runner.ModelName, runner.Policy, workerURL, instDesc, resp.StatusCode)
+				trace.SetTarget(runner.ModelName, string(runner.Policy), workerURL, meta.WorkerName, meta.InstanceName)
 
 				s.workerMu.Lock()
 				if wb, ok := s.workerStates[workerURL]; ok {
@@ -1026,6 +1085,16 @@ func (s *Supervisor) handleProxy(w http.ResponseWriter, req *http.Request) {
 				}
 				s.workerMu.Unlock()
 			}
+
+			var errSnippet string
+			if resp.StatusCode >= 400 {
+				errSnippet = logger.PeekErrorResponseBody(resp, 1024)
+			}
+			trace.LogFirstByte(resp.StatusCode, resp.Header.Get("Content-Type"), errSnippet)
+			statusCode := resp.StatusCode
+			resp.Body = logger.WrapResponseBody(resp.Body, func(bytesRead int64, readErr error) {
+				trace.LogDone(statusCode, bytesRead, readErr, req.Context().Err())
+			})
 			return nil
 		},
 		ErrorHandler: func(rw http.ResponseWriter, r *http.Request, err error) {
@@ -1037,13 +1106,13 @@ func (s *Supervisor) handleProxy(w http.ResponseWriter, req *http.Request) {
 				s.workerMu.Unlock()
 			}
 			if errors.Is(err, context.Canceled) || errors.Is(r.Context().Err(), context.Canceled) {
-				log.Printf("[Supervisor:Proxy] Client canceled/disconnected request for model %s (Queue timeout or User abort)", runner.ModelName)
+				trace.LogGatewayFail(499, err, r.Context().Err())
 				return
 			}
-			log.Printf("[Supervisor:Proxy] Forwarding error for model %s: %v", runner.ModelName, err)
+			trace.LogGatewayFail(http.StatusBadGateway, err, r.Context().Err())
 			go s.fastProbeRunner(runner)
 			rw.WriteHeader(http.StatusBadGateway)
-			_, _ = rw.Write([]byte(fmt.Sprintf(`{"error":{"message":"Router gateway error for model %s: %v","type":"bad_gateway"}}`, runner.ModelName, err)))
+			_, _ = rw.Write([]byte(fmt.Sprintf(`{"error":{"message":"Router gateway error for model %s: %v","type":"bad_gateway","request_id":%q}}`, runner.ModelName, err, trace.ReqID)))
 		},
 	}
 
@@ -1151,6 +1220,9 @@ func (s *Supervisor) spawnProcessForModel(ctx context.Context, modelName string,
 	}
 
 	prefix := fmt.Sprintf("[vllm-router:%d]", port)
+	if modelName != "" {
+		prefix = fmt.Sprintf("[vllm-router:%d|%s]", port, modelName)
+	}
 	go streamPipe(stdout, prefix)
 	go streamPipe(stderr, prefix)
 
@@ -1436,7 +1508,7 @@ func (s *Supervisor) fastProbeRunner(runner *ModelRunner) {
 func StreamPipe(r io.Reader, prefix string) {
 	scanner := bufio.NewScanner(r)
 	for scanner.Scan() {
-		logger.LogLine(fmt.Sprintf("%s %s", prefix, scanner.Text()))
+		logger.LogSubprocessLine(prefix, scanner.Text())
 	}
 }
 

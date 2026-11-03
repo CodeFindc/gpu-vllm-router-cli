@@ -13,6 +13,7 @@ import (
 	"net/url"
 	"os"
 	"os/exec"
+	"path/filepath"
 	"sort"
 	"strings"
 	"sync"
@@ -44,6 +45,10 @@ type ServerConfig struct {
 	BalanceRelThreshold *float64
 	CacheThreshold      *float64
 	ExtraArgs           []string
+	RouterBin           string
+	Backend             string
+	LogLevel            string
+	LogDir              string
 	AutoHeal            config.AutoHealConfig
 }
 
@@ -68,6 +73,16 @@ type routeState struct {
 	target   *BackendTarget
 	balancer Balancer
 	pool     *ModelPool
+	trace    *logger.CallTrace
+	released atomic.Bool
+}
+
+func (rs *routeState) releaseConn() {
+	if rs != nil && rs.target != nil && rs.balancer != nil {
+		if rs.released.CompareAndSwap(false, true) {
+			rs.balancer.RecordRequestEnd(rs.target)
+		}
+	}
 }
 
 // retryTransport wraps http.RoundTripper with transparent failover and circuit breaker tracking.
@@ -98,7 +113,10 @@ func (t *retryTransport) RoundTrip(req *http.Request) (*http.Response, error) {
 			}
 		}
 
+		attemptStart := time.Now()
 		resp, err := t.base.RoundTrip(req)
+		attemptCost := time.Since(attemptStart)
+
 		if err == nil && resp.StatusCode < 500 {
 			if state.target.CircuitBreaker != nil {
 				state.target.CircuitBreaker.RecordSuccess()
@@ -112,10 +130,20 @@ func (t *retryTransport) RoundTrip(req *http.Request) (*http.Response, error) {
 			return resp, err
 		}
 
+		failReason := err
+		if failReason == nil && resp != nil {
+			errSnippet := logger.PeekErrorResponseBody(resp, 512)
+			if errSnippet != "" {
+				failReason = fmt.Errorf("HTTP %d (%s)", resp.StatusCode, errSnippet)
+			} else {
+				failReason = fmt.Errorf("HTTP %d %s", resp.StatusCode, http.StatusText(resp.StatusCode))
+			}
+		}
+
 		lastResp = resp
 		lastErr = err
 		if state.target.CircuitBreaker != nil {
-			state.target.CircuitBreaker.RecordFailure(err)
+			state.target.CircuitBreaker.RecordFailure(failReason)
 		}
 
 		if attempt >= maxRetries {
@@ -128,7 +156,11 @@ func (t *retryTransport) RoundTrip(req *http.Request) (*http.Response, error) {
 		// Try to select alternative healthy target for this model
 		nextTarget, selectErr := state.pool.Balancer.SelectTargetExcluding(req, excluded)
 		if selectErr != nil {
-			log.Printf("[Proxy:Failover] No alternative healthy backends available for model %s: %v", state.pool.ModelName, selectErr)
+			if state.trace != nil {
+				state.trace.LogRetryExhausted(attempt+1, selectErr)
+			} else {
+				log.Printf("[Proxy:Failover] No alternative healthy backends available for model %s: %v", state.pool.ModelName, selectErr)
+			}
 			break
 		}
 
@@ -136,8 +168,17 @@ func (t *retryTransport) RoundTrip(req *http.Request) (*http.Response, error) {
 		state.balancer.RecordRequestEnd(state.target)
 		state.balancer.RecordRequestStart(nextTarget)
 
-		log.Printf("[Proxy:Failover] ⚡ Target %s failed (%v). Retrying on alternative target %s (attempt %d/%d)...",
-			state.target.URLString, err, nextTarget.URLString, attempt+1, maxRetries)
+		t.server.endpointsMu.RLock()
+		nextMeta := t.server.endpointsMeta[nextTarget.URLString]
+		t.server.endpointsMu.RUnlock()
+
+		if state.trace != nil {
+			state.trace.LogRetry(attempt+1, maxRetries, state.target.URLString, failReason, attemptCost,
+				nextTarget.URLString, nextMeta.WorkerName, nextMeta.InstanceName)
+		} else {
+			log.Printf("[Proxy:Failover] ⚡ Target %s failed (%v). Retrying on alternative target %s (attempt %d/%d)...",
+				state.target.URLString, failReason, nextTarget.URLString, attempt+1, maxRetries)
+		}
 
 		if resp != nil && resp.Body != nil {
 			_ = resp.Body.Close()
@@ -329,12 +370,47 @@ func (s *Server) findModelPool(modelName string) (*ModelPool, error) {
 	return nil, fmt.Errorf("model %q does not exist or has no healthy instances in cluster. Available: %v", modelName, available)
 }
 
+// extractRequestMeta extracts model, stream flag, session key, and raw body bytes from the request.
+func extractRequestMeta(req *http.Request) (model string, stream bool, sessionKey string, bodyBytes []byte) {
+	if req == nil {
+		return "", false, "", nil
+	}
+	model = req.URL.Query().Get("model")
+	if req.Body != nil && (req.Method == http.MethodPost || req.Method == http.MethodPut) {
+		bodyBytes = getOrReadRequestBody(req)
+		if len(bodyBytes) > 0 {
+			var peek struct {
+				Model  string `json:"model"`
+				Stream bool   `json:"stream"`
+			}
+			if err := json.Unmarshal(bodyBytes, &peek); err == nil {
+				if model == "" && peek.Model != "" {
+					model = peek.Model
+				}
+				stream = peek.Stream
+			}
+		}
+	}
+	sessionKey = extractSessionKey(req)
+	return model, stream, sessionKey, bodyBytes
+}
+
 func (s *Server) director(req *http.Request) {
-	modelName, _ := extractModelFromRequest(req)
+	modelName, stream, sessionKey, bodyBytes := extractRequestMeta(req)
+	trace := logger.NewCallTrace(req, modelName, stream, sessionKey, bodyBytes, "proxy")
+	if req.Header == nil {
+		req.Header = make(http.Header)
+	}
+	req.Header.Set("X-Request-ID", trace.ReqID)
+	trace.LogRecv()
+
+	ctx := context.WithValue(req.Context(), "call_trace", trace)
+	*req = *req.WithContext(ctx)
+
 	pool, err := s.findModelPool(modelName)
 	if err != nil {
-		log.Printf("[Proxy] Model routing error: %v (Request Path: %s)", err, req.URL.Path)
-		ctx := context.WithValue(req.Context(), "route_error", err)
+		trace.LogRouteError(err)
+		ctx = context.WithValue(req.Context(), "route_error", err)
 		*req = *req.WithContext(ctx)
 		return
 	}
@@ -353,13 +429,9 @@ func (s *Server) director(req *http.Request) {
 		}
 		s.endpointsMu.RUnlock()
 
-		if len(pool.Targets) == 1 && len(workerDescs) > 0 {
-			logger.Debugf("[Proxy:Route] 🚀 [Model: %s] [Policy: %s] %s %s -> Worker: %s (Mode: run)",
-				pool.ModelName, pool.Policy, req.Method, req.URL.Path, workerDescs[0])
-		} else {
-			logger.Debugf("[Proxy:Route] 🔀 [Model: %s] [Policy: %s] %s %s -> vllm-router (%s) | Workers: [%s]",
-				pool.ModelName, pool.Policy, req.Method, req.URL.Path, pool.RunnerTarget.String(), strings.Join(workerDescs, ", "))
-		}
+		runnerDesc := fmt.Sprintf("vllm-router (%s)", pool.RunnerTarget.String())
+		trace.SetTarget(pool.ModelName, string(pool.Policy), runnerDesc, strings.Join(workerDescs, ", "), "")
+		trace.LogRoute(0, DescribeRoutingKey(pool.Policy, req))
 
 		req.URL.Scheme = pool.RunnerTarget.Scheme
 		req.URL.Host = pool.RunnerTarget.Host
@@ -367,15 +439,21 @@ func (s *Server) director(req *http.Request) {
 		if _, ok := req.Header["User-Agent"]; !ok {
 			req.Header.Set("User-Agent", "gpu-vllm-router-hybrid/1.0")
 		}
-		ctx := context.WithValue(req.Context(), "routed_model", pool.ModelName)
+		state := &routeState{
+			pool:  pool,
+			trace: trace,
+		}
+		ctx = context.WithValue(req.Context(), "route_state", state)
+		ctx = context.WithValue(ctx, "routed_model", pool.ModelName)
 		*req = *req.WithContext(ctx)
 		return
 	}
 
 	target, err := pool.Balancer.SelectTarget(req)
 	if err != nil {
-		log.Printf("[Proxy] Balancer error for model %s: %v", pool.ModelName, err)
-		ctx := context.WithValue(req.Context(), "route_error", err)
+		trace.SetTarget(pool.ModelName, string(pool.Policy), "", "", "")
+		trace.LogRouteError(err)
+		ctx = context.WithValue(req.Context(), "route_error", err)
 		*req = *req.WithContext(ctx)
 		return
 	}
@@ -385,23 +463,20 @@ func (s *Server) director(req *http.Request) {
 
 	// Fetch endpoint metadata for instance/worker name
 	s.endpointsMu.RLock()
-	epMeta, hasMeta := s.endpointsMeta[target.URLString]
+	epMeta := s.endpointsMeta[target.URLString]
 	s.endpointsMu.RUnlock()
-	instDesc := ""
-	if hasMeta && epMeta.WorkerName != "" {
-		instDesc = fmt.Sprintf(" (Worker: %s, Instance: %s)", epMeta.WorkerName, epMeta.InstanceName)
-	}
 
-	logger.Debugf("[Proxy:Route] 🚀 [Model: %s] [Policy: %s] %s %s -> %s%s (ActiveConns: %d)",
-		pool.ModelName, pool.Policy, req.Method, req.URL.Path, target.URLString, instDesc, atomic.LoadInt64(&target.ActiveConns))
+	trace.SetTarget(pool.ModelName, string(pool.Policy), target.URLString, epMeta.WorkerName, epMeta.InstanceName)
+	trace.LogRoute(atomic.LoadInt64(&target.ActiveConns), DescribeRoutingKey(pool.Policy, req))
 
 	// Save routeState in context for retryTransport, modifyResponse, and errorHandler
 	state := &routeState{
 		target:   target,
 		balancer: pool.Balancer,
 		pool:     pool,
+		trace:    trace,
 	}
-	ctx := context.WithValue(req.Context(), "route_state", state)
+	ctx = context.WithValue(req.Context(), "route_state", state)
 	ctx = context.WithValue(ctx, "routed_model", pool.ModelName)
 	*req = *req.WithContext(ctx)
 
@@ -417,14 +492,18 @@ func (s *Server) director(req *http.Request) {
 func (s *Server) modifyResponse(resp *http.Response) error {
 	ctx := resp.Request.Context()
 	state, _ := ctx.Value("route_state").(*routeState)
-	if state != nil && state.target != nil && state.balancer != nil {
-		state.balancer.RecordRequestEnd(state.target)
+	trace, _ := ctx.Value("call_trace").(*logger.CallTrace)
+	if trace == nil && state != nil {
+		trace = state.trace
 	}
 
 	// Add router indicators
 	resp.Header.Set("X-Router-Policy", string(s.cfg.Policy))
 	if m, ok := ctx.Value("routed_model").(string); ok && m != "" {
 		resp.Header.Set("X-Routed-Model", m)
+	}
+	if trace != nil && trace.ReqID != "" {
+		resp.Header.Set("X-Request-ID", trace.ReqID)
 	}
 
 	workerURL := resp.Header.Get("x-vllm-router-worker")
@@ -433,34 +512,66 @@ func (s *Server) modifyResponse(resp *http.Response) error {
 	}
 	if workerURL != "" {
 		s.endpointsMu.RLock()
-		meta, ok := s.endpointsMeta[workerURL]
+		meta := s.endpointsMeta[workerURL]
 		s.endpointsMu.RUnlock()
-		instDesc := ""
-		if ok && meta.WorkerName != "" {
-			instDesc = fmt.Sprintf(" (Worker: %s, Instance: %s)", meta.WorkerName, meta.InstanceName)
+		if trace != nil {
+			trace.SetTarget("", "", workerURL, meta.WorkerName, meta.InstanceName)
 		}
-		log.Printf("[Proxy:Route] 🎯 Real Worker: %s%s (Status: %d)", workerURL, instDesc, resp.StatusCode)
 	}
+
+	if trace != nil {
+		var errSnippet string
+		if resp.StatusCode >= 400 {
+			errSnippet = logger.PeekErrorResponseBody(resp, 1024)
+		}
+		trace.LogFirstByte(resp.StatusCode, resp.Header.Get("Content-Type"), errSnippet)
+	}
+
+	statusCode := resp.StatusCode
+	resp.Body = logger.WrapResponseBody(resp.Body, func(bytesRead int64, readErr error) {
+		if state != nil {
+			state.releaseConn()
+		}
+		if trace != nil {
+			trace.LogDone(statusCode, bytesRead, readErr, ctx.Err())
+		}
+	})
 	return nil
 }
 
 func (s *Server) errorHandler(w http.ResponseWriter, req *http.Request, err error) {
 	ctx := req.Context()
 	state, _ := ctx.Value("route_state").(*routeState)
-	if state != nil && state.target != nil && state.balancer != nil {
-		state.balancer.RecordRequestEnd(state.target)
+	trace, _ := ctx.Value("call_trace").(*logger.CallTrace)
+	if trace == nil && state != nil {
+		trace = state.trace
+	}
+	if state != nil {
+		state.releaseConn()
 	}
 
-	// If route_error occurred (model not found)
+	reqID := ""
+	if trace != nil {
+		reqID = trace.ReqID
+		if reqID != "" {
+			w.Header().Set("X-Request-ID", reqID)
+		}
+	}
+
+	// If route_error occurred (model not found or all backends isolated)
 	if routeErr, ok := ctx.Value("route_error").(error); ok && routeErr != nil {
+		if trace != nil {
+			trace.LogGatewayFail(http.StatusNotFound, routeErr, ctx.Err())
+		}
 		w.Header().Set("Content-Type", "application/json")
 		w.WriteHeader(http.StatusNotFound)
 		_ = json.NewEncoder(w).Encode(map[string]interface{}{
 			"error": map[string]interface{}{
-				"message": routeErr.Error(),
-				"type":    "invalid_request_error",
-				"param":   "model",
-				"code":    "model_not_found",
+				"message":    routeErr.Error(),
+				"type":       "invalid_request_error",
+				"param":      "model",
+				"code":       "model_not_found",
+				"request_id": reqID,
 			},
 		})
 		return
@@ -468,18 +579,27 @@ func (s *Server) errorHandler(w http.ResponseWriter, req *http.Request, err erro
 
 	// If client canceled/aborted or timed out while waiting in queue, do not write 502
 	if errors.Is(err, context.Canceled) || errors.Is(ctx.Err(), context.Canceled) {
-		log.Printf("[Proxy] Client canceled/disconnected request for %s (Queue timeout or User abort)", req.URL.String())
+		if trace != nil {
+			trace.LogGatewayFail(499, err, ctx.Err())
+		} else {
+			log.Printf("[Proxy] Client canceled/disconnected request for %s (Queue timeout or User abort)", req.URL.String())
+		}
 		return
 	}
 
-	log.Printf("[Proxy] Forwarding error to %s: %v", req.URL.String(), err)
+	if trace != nil {
+		trace.LogGatewayFail(http.StatusBadGateway, err, ctx.Err())
+	} else {
+		log.Printf("[Proxy] Forwarding error to %s: %v", req.URL.String(), err)
+	}
 	w.Header().Set("Content-Type", "application/json")
 	w.WriteHeader(http.StatusBadGateway)
 	_ = json.NewEncoder(w).Encode(map[string]interface{}{
 		"error": map[string]interface{}{
-			"message": fmt.Sprintf("GPU router backend error: %v", err),
-			"type":    "router_bad_gateway",
-			"code":    502,
+			"message":    fmt.Sprintf("GPU router backend error: %v", err),
+			"type":       "router_bad_gateway",
+			"code":       502,
+			"request_id": reqID,
 		},
 	})
 }
@@ -1002,6 +1122,7 @@ func (s *Server) handleModels(w http.ResponseWriter, r *http.Request) {
 		}
 	}
 
+	logger.Infof("[Proxy:API] 📋 GET /v1/models | Client: %s | ReturnedModels: %d", logger.ExtractClientIP(r), len(data))
 	w.Header().Set("Content-Type", "application/json")
 	_ = json.NewEncoder(w).Encode(map[string]interface{}{
 		"object": "list",
@@ -1498,24 +1619,59 @@ func (s *Server) startRunnerForPool(pool *ModelPool, urls []string) error {
 		extraArgs = s.cfg.ExtraArgs
 	}
 
+	routerBin := s.cfg.RouterBin
+	if routerBin == "" {
+		routerBin = "vllm-router"
+	}
+	backend := s.cfg.Backend
+	if backend == "" {
+		backend = "vllm"
+	}
+	logLevel := s.cfg.LogLevel
+	if logLevel == "" {
+		logLevel = "info"
+	}
+	if pool.Policy == router.PolicyCacheAware && s.cfg.LogLevel == "" {
+		logLevel = "debug"
+	}
+
+	logDir := s.cfg.LogDir
+	s.mu.RLock()
+	rule, hasRule := s.modelRules[pool.ModelName]
+	s.mu.RUnlock()
+	if hasRule && rule.LogDir != "" {
+		logDir = rule.LogDir
+	} else if logDir != "" && pool.ModelName != "" {
+		cleanModel := strings.ReplaceAll(pool.ModelName, "/", "_")
+		cleanModel = strings.ReplaceAll(cleanModel, "\\", "_")
+		cleanModel = strings.ReplaceAll(cleanModel, ":", "_")
+		logDir = filepath.Join(logDir, cleanModel)
+	}
+	if logDir != "" {
+		if err := os.MkdirAll(logDir, 0755); err != nil {
+			log.Printf("[Proxy] Warning: failed to create log directory %q: %v", logDir, err)
+		}
+	}
+
 	cfg := router.Config{
-		RouterBin:           "vllm-router",
+		RouterBin:           routerBin,
 		Host:                "127.0.0.1",
 		Port:                freePort,
 		Policy:              pool.Policy,
 		WorkerURLs:          urls,
-		Backend:             "vllm",
-		LogLevel:            "info",
+		Backend:             backend,
+		LogLevel:            logLevel,
+		LogDir:              logDir,
 		BalanceAbsThreshold: balAbs,
 		BalanceRelThreshold: balRel,
 		CacheThreshold:      cacheThresh,
 		ExtraArgs:           extraArgs,
 	}
-	if pool.Policy == router.PolicyCacheAware {
-		cfg.LogLevel = "debug"
-	}
 	args := router.BuildArgs(cfg)
-	cmd := exec.Command("vllm-router", args...)
+	log.Printf("[Proxy] Spawning %s on 127.0.0.1:%d (Model: %q, Workers: %d, Policy: %s, LogLevel: %s, LogDir: %q)",
+		routerBin, freePort, pool.ModelName, len(urls), pool.Policy, logLevel, logDir)
+
+	cmd := exec.Command(routerBin, args...)
 	cmd.Env = append(os.Environ(), "RUST_LOG=vllm_router=debug,info")
 
 	stdout, _ := cmd.StdoutPipe()
@@ -1525,13 +1681,17 @@ func (s *Server) startRunnerForPool(pool *ModelPool, urls []string) error {
 		return err
 	}
 
-	prefix := fmt.Sprintf("[vllm-router:%d]", freePort)
+	prefix := fmt.Sprintf("[vllm-router:%d|%s]", freePort, pool.ModelName)
 	if stdout != nil {
 		go router.StreamPipe(stdout, prefix)
 	}
 	if stderr != nil {
 		go router.StreamPipe(stderr, prefix)
 	}
+	go func() {
+		waitErr := cmd.Wait()
+		log.Printf("%s Process exited: %v", prefix, waitErr)
+	}()
 
 	s.mu.Lock()
 	pool.RunnerCmd = cmd

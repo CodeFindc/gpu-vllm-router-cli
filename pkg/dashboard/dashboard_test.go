@@ -6,8 +6,11 @@ import (
 	"encoding/json"
 	"net/http"
 	"net/http/httptest"
+	"os"
 	"strings"
 	"testing"
+
+	"gpu-vllm-router/pkg/logger"
 )
 
 type mockProvider struct {
@@ -263,4 +266,42 @@ func TestDashboardConfigAPI(t *testing.T) {
 		t.Errorf("unexpected model rule response: %+v", modelResp)
 	}
 }
+
+func TestDashboardAdminAuditLogging(t *testing.T) {
+	var logBuf bytes.Buffer
+	origLevel := logger.GetLevel()
+	logger.SetOutput(&logBuf)
+	logger.SetLevel(logger.LevelInfo)
+	defer func() {
+		logger.SetOutput(os.Stderr)
+		logger.SetLevel(origLevel)
+	}()
+
+	mock := &mockProvider{probeOK: true}
+	h := NewHandler(mock)
+
+	// 1. Probe
+	probeBody, _ := json.Marshal(ProbeRequest{URL: "http://worker-1:8000"})
+	h.ServeHTTP(httptest.NewRecorder(), httptest.NewRequest(http.MethodPost, "/api/probe", bytes.NewReader(probeBody)))
+
+	// 2. Reset Breaker
+	resetBody, _ := json.Marshal(ResetBreakerRequest{URL: "http://worker-1:8000"})
+	h.ServeHTTP(httptest.NewRecorder(), httptest.NewRequest(http.MethodPost, "/api/reset-breaker", bytes.NewReader(resetBody)))
+
+	// 3. Update Model Rule
+	ruleBody, _ := json.Marshal(ModelRuleUpdateRequest{ModelName: "DeepSeek-V4", Mode: "proxy", Policy: "cache_aware"})
+	h.ServeHTTP(httptest.NewRecorder(), httptest.NewRequest(http.MethodPost, "/api/models/rule", bytes.NewReader(ruleBody)))
+
+	logs := logBuf.String()
+	for _, exp := range []string{
+		"[Admin:API] 🔍 手动健康探测成功",
+		"[Admin:API] 🔄 手动重置熔断器成功",
+		"[Admin:API] ⚙️ 模型路由规则已热更新",
+	} {
+		if !strings.Contains(logs, exp) {
+			t.Errorf("expected admin audit logs to contain %q, got:\n%s", exp, logs)
+		}
+	}
+}
+
 

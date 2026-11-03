@@ -138,3 +138,33 @@ func TestConcurrentLogging(t *testing.T) {
 		t.Errorf("expected concurrent output to buffer")
 	}
 }
+
+func TestStripANSIAndSubprocessLogging(t *testing.T) {
+	ansiLine := "\x1b[2m2026-11-03T09:50:00Z\x1b[0m \x1b[34mDEBUG\x1b[0m vllm_router::routers::cache_aware: Routed request to http://10.0.0.1:8000 (cache hit 0.85)"
+	clean := StripANSI(ansiLine)
+	if strings.Contains(clean, "\x1b") {
+		t.Fatalf("expected ANSI escape codes to be stripped, got: %q", clean)
+	}
+	if DetectLevel(clean) != LevelDebug {
+		t.Errorf("expected LevelDebug after stripping ANSI, got %v", DetectLevel(clean))
+	}
+
+	var buf bytes.Buffer
+	l := New(&buf, LevelInfo)
+
+	// Subprocess debug line should be preserved when logger is at default LevelInfo
+	l.LogSubprocessLine("[vllm-router:54321|DeepSeek-V4]", ansiLine)
+	out := buf.String()
+	if !strings.Contains(out, "[DEBUG] [vllm-router:54321|DeepSeek-V4]") || !strings.Contains(out, "cache hit 0.85") {
+		t.Errorf("expected subprocess debug routing log to be preserved at LevelInfo, got:\n%s", out)
+	}
+
+	// When logger is set to LevelWarn, subprocess debug/info should be suppressed
+	buf.Reset()
+	l.SetLevel(LevelWarn)
+	l.LogSubprocessLine("[vllm-router:54321|DeepSeek-V4]", ansiLine)
+	if buf.Len() > 0 {
+		t.Errorf("expected subprocess debug log to be suppressed at LevelWarn, got:\n%s", buf.String())
+	}
+}
+

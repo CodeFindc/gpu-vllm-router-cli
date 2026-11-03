@@ -366,6 +366,10 @@ func main() {
 			fmt.Println("-------------------------------------------------------------------")
 			for _, ep := range endpoints {
 				fmt.Printf("%-18s | %-15s | %-16s | %-6d | %s\n", ep.InstanceName, ep.WorkerName, ep.IP, ep.Port, ep.URL)
+				if *mode != "cmd" {
+					logger.Infof("[Discovery] 模型: %s (ID: %d, 后端: %s) | 实例: %s | Worker: %s | URL: %s",
+						model.Name, model.ID, model.Backend, ep.InstanceName, ep.WorkerName, ep.URL)
+				}
 				workerURLs = append(workerURLs, ep.URL)
 			}
 			fmt.Println("===================================================================")
@@ -397,6 +401,10 @@ func main() {
 				for _, ep := range eps {
 					fmt.Printf("    -> 实例: %-25s Worker: %-12s IP: %-15s 端口: %-6d URL: %s\n",
 						ep.InstanceName, ep.WorkerName, ep.IP, ep.Port, ep.URL)
+					if *mode != "cmd" {
+						logger.Infof("[Discovery] 模型: %s | 实例: %s | Worker: %s | URL: %s",
+							mName, ep.InstanceName, ep.WorkerName, ep.URL)
+					}
 					workerURLs = append(workerURLs, ep.URL)
 				}
 			}
@@ -619,6 +627,10 @@ func main() {
 			BalanceRelThreshold: balRelPtr,
 			CacheThreshold:      cacheThreshPtr,
 			ExtraArgs:           routerCfg.ExtraArgs,
+			RouterBin:           *routerBin,
+			Backend:             *backendFlag,
+			LogLevel:            *logLevelFlag,
+			LogDir:              *logDirFlag,
 		}
 		if fileCfg != nil {
 			proxyCfg.AutoHeal = fileCfg.AutoHeal

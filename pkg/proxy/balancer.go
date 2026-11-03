@@ -3,6 +3,7 @@ package proxy
 import (
 	"encoding/json"
 	"errors"
+	"fmt"
 	"hash/fnv"
 	"math/rand"
 	"net/http"
@@ -562,6 +563,23 @@ func extractCacheAwareKeyInfo(r *http.Request) CacheAwareKeyInfo {
 
 func extractCacheAwareKey(r *http.Request) string {
 	return extractCacheAwareKeyInfo(r).RawKey
+}
+
+// DescribeRoutingKey returns a concise summary of the routing key used by the given policy for logging.
+func DescribeRoutingKey(policy router.Policy, r *http.Request) string {
+	if r == nil {
+		return string(policy)
+	}
+	switch policy {
+	case router.PolicyConsistentHash, router.PolicyRendezvousHash:
+		key := extractSessionKey(r)
+		return fmt.Sprintf("session=%q (hash=0x%08x)", key, hashKey(key))
+	case router.PolicyCacheAware:
+		info := extractCacheAwareKeyInfo(r)
+		return fmt.Sprintf("[%s] hash=0x%08x len=%d sample=%q", info.Source, info.Hash, info.KeyLength, info.KeyPreview)
+	default:
+		return string(policy)
+	}
 }
 
 // NewBalancer creates a Balancer based on Policy.

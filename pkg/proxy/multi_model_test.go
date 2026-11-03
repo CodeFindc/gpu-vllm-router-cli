@@ -7,6 +7,7 @@ import (
 	"net/http"
 	"net/http/httptest"
 	"net/url"
+	"os"
 	"path/filepath"
 	"strings"
 	"testing"
@@ -14,6 +15,7 @@ import (
 	"gpu-vllm-router/pkg/config"
 	"gpu-vllm-router/pkg/dashboard"
 	"gpu-vllm-router/pkg/gpustack"
+	"gpu-vllm-router/pkg/logger"
 	"gpu-vllm-router/pkg/router"
 )
 
@@ -379,5 +381,105 @@ func TestProxy_ClientContextCanceledDoesNotTripBreaker(t *testing.T) {
 		t.Errorf("expected 0 failure count on client cancellations, got %d", fails)
 	}
 }
+
+func TestProxyCallLoggingAndErrorSnapshot(t *testing.T) {
+	var logBuf bytes.Buffer
+	origLevel := logger.GetLevel()
+	logger.SetOutput(&logBuf)
+	logger.SetLevel(logger.LevelInfo)
+	defer func() {
+		logger.SetOutput(os.Stderr)
+		logger.SetLevel(origLevel)
+	}()
+
+	var receivedReqID string
+	backend := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		receivedReqID = r.Header.Get("X-Request-ID")
+		if strings.Contains(r.URL.RawQuery, "fail400=1") {
+			w.Header().Set("Content-Type", "application/json")
+			w.WriteHeader(http.StatusBadRequest)
+			_, _ = w.Write([]byte(`{"error":{"message":"invalid temperature parameter","code":400}}`))
+			return
+		}
+		w.Header().Set("Content-Type", "application/json")
+		w.WriteHeader(http.StatusOK)
+		_, _ = w.Write([]byte(`{"id":"chatcmpl-123","choices":[{"message":{"content":"ok"}}]}`))
+	}))
+	defer backend.Close()
+
+	srv := NewServer(ServerConfig{
+		Policy:    router.PolicyConsistentHash,
+		ModelName: "deepseek-r1",
+	}, nil)
+
+	srv.updateSingleModelEndpoints("deepseek-r1", []gpustack.WorkerEndpoint{
+		{
+			ModelName:    "deepseek-r1",
+			WorkerName:   "gpu-node-01",
+			InstanceName: "deepseek-r1-inst-01",
+			URL:          backend.URL,
+		},
+	})
+
+	// 1. Test successful request full 4-stage logging
+	reqBody := `{"model":"deepseek-r1","stream":false,"messages":[{"role":"user","content":"ping"}]}`
+	req := httptest.NewRequest(http.MethodPost, "http://localhost:8000/v1/chat/completions", strings.NewReader(reqBody))
+	req.Header.Set("X-Session-ID", "sess-007")
+	rec := httptest.NewRecorder()
+
+	srv.reverseProxy.ServeHTTP(rec, req)
+
+	resp := rec.Result()
+	defer resp.Body.Close()
+	respReqID := resp.Header.Get("X-Request-ID")
+	if respReqID == "" || respReqID != receivedReqID {
+		t.Fatalf("expected matching non-empty X-Request-ID in backend and response, got resp=%q backend=%q", respReqID, receivedReqID)
+	}
+
+	logs := logBuf.String()
+	for _, stage := range []string{
+		"[Call:RECV] [ReqID: " + respReqID + "]",
+		"[Call:ROUTE] [ReqID: " + respReqID + "]",
+		"Worker: gpu-node-01, Instance: deepseek-r1-inst-01",
+		"[Call:RESP] [ReqID: " + respReqID + "]",
+		"[Call:DONE] [ReqID: " + respReqID + "]",
+	} {
+		if !strings.Contains(logs, stage) {
+			t.Errorf("expected logs to contain %q, got:\n%s", stage, logs)
+		}
+	}
+
+	// Verify ActiveConns was decremented back to 0 upon completion
+	if active := srv.modelPools["deepseek-r1"].Targets[0].ActiveConns; active != 0 {
+		t.Errorf("expected ActiveConns=0 after completion, got %d", active)
+	}
+
+	// 2. Test 400 Bad Request captures request & error response snippet while preserving client body
+	logBuf.Reset()
+	req400 := httptest.NewRequest(http.MethodPost, "http://localhost:8000/v1/chat/completions?fail400=1", strings.NewReader(`{"model":"deepseek-r1","temperature":99}`))
+	req400.Header.Set("X-Request-ID", "req-custom-400")
+	rec400 := httptest.NewRecorder()
+
+	srv.reverseProxy.ServeHTTP(rec400, req400)
+	if rec400.Code != http.StatusBadRequest {
+		t.Fatalf("expected 400 status, got %d", rec400.Code)
+	}
+	if !strings.Contains(rec400.Body.String(), "invalid temperature parameter") {
+		t.Errorf("expected client to receive intact 400 error body, got %q", rec400.Body.String())
+	}
+
+	logs400 := logBuf.String()
+	for _, exp := range []string{
+		"[WARN] [Call:RESP_ERR] [ReqID: req-custom-400]",
+		`"temperature":99`,
+		`invalid temperature parameter`,
+		"[WARN] [Call:DONE] [ReqID: req-custom-400]",
+	} {
+		if !strings.Contains(logs400, exp) {
+			t.Errorf("expected 400 logs to contain %q, got:\n%s", exp, logs400)
+		}
+	}
+}
+
 
 

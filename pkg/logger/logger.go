@@ -129,9 +129,35 @@ func (l *Logger) Logf(level Level, format string, v ...interface{}) {
 	l.std.Printf("[%s] %s", level.String(), msg)
 }
 
+// StripANSI removes ANSI terminal color/formatting escape sequences (e.g. \x1b[32m...\x1b[0m)
+// from a string so log files remain clean and level detection works reliably.
+func StripANSI(s string) string {
+	if !strings.Contains(s, "\x1b") {
+		return s
+	}
+	var sb strings.Builder
+	sb.Grow(len(s))
+	i := 0
+	for i < len(s) {
+		if s[i] == '\x1b' && i+1 < len(s) && s[i+1] == '[' {
+			i += 2
+			for i < len(s) && ((s[i] >= '0' && s[i] <= '9') || s[i] == ';') {
+				i++
+			}
+			if i < len(s) && ((s[i] >= 'A' && s[i] <= 'Z') || (s[i] >= 'a' && s[i] <= 'z')) {
+				i++
+			}
+			continue
+		}
+		sb.WriteByte(s[i])
+		i++
+	}
+	return sb.String()
+}
+
 // LogLine logs a pre-formatted string line, inferring its level from keywords if not explicit.
 func (l *Logger) LogLine(line string) {
-	line = strings.TrimRight(line, "\r\n")
+	line = StripANSI(strings.TrimRight(line, "\r\n"))
 	if len(line) == 0 {
 		return
 	}
@@ -152,6 +178,33 @@ func (l *Logger) LogLine(line string) {
 		l.std.Println(line)
 	} else {
 		l.std.Printf("[%s] %s", level.String(), line)
+	}
+}
+
+// LogSubprocessLine logs a line emitted by a managed child process (e.g. vllm-router).
+// It strips ANSI escape codes and preserves child output (including child DEBUG routing logs
+// when the child process was explicitly started with debug logging) unless the global logger
+// is configured strictly above INFO (e.g. WARN or ERROR).
+func (l *Logger) LogSubprocessLine(prefix, rawLine string) {
+	clean := strings.TrimSpace(StripANSI(strings.TrimRight(rawLine, "\r\n")))
+	if len(clean) == 0 {
+		return
+	}
+
+	level := DetectLevel(clean)
+
+	l.mu.RLock()
+	curLevel := l.level
+	l.mu.RUnlock()
+
+	if curLevel > LevelInfo && level < curLevel {
+		return
+	}
+
+	if prefix != "" {
+		l.std.Printf("[%s] %s %s", level.String(), prefix, clean)
+	} else {
+		l.std.Printf("[%s] %s", level.String(), clean)
 	}
 }
 
@@ -201,6 +254,11 @@ func Fatalf(format string, v ...interface{}) {
 // LogLine logs a single line using the global logger with automatic level detection and filtering.
 func LogLine(line string) {
 	globalLogger.LogLine(line)
+}
+
+// LogSubprocessLine logs a single line from a managed child process using the global logger.
+func LogSubprocessLine(prefix, rawLine string) {
+	globalLogger.LogSubprocessLine(prefix, rawLine)
 }
 
 type bridgeWriter struct {
