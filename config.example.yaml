@@ -29,8 +29,9 @@ target:
   # 全局默认负载均衡调度策略:
   # - consistent_hash: 一致性哈希，根据会话 (X-Session-ID / X-User-ID) 绑定 Worker，实现多轮对话上下文与 KV 缓存复用
   # - cache_aware:     前缀缓存感知优化路由（官方推荐，根据请求前缀命中率结合实例负载动态选择最佳 Worker）
+  # - least_waiting:   基于实例 /metrics 实时 waiting/running 排队指标的最小排队优先调度（proxy 模式推荐，彻底消除单节点积压）
   # - round_robin:     简单轮询，适用于无状态、短会话、请求大小均等的推理场景
-  # - power_of_two:    P2C 算法，随机在两台 Worker 中挑选活跃连接数较少的一台
+  # - power_of_two:    P2C 算法，随机在两台 Worker 中挑选负载（waiting/running/连接数）较低的一台
   # - random:          纯随机负载分发
   # - rendezvous_hash: 最高随机权重哈希 (HRW)，节点增删时节点迁移量最小，缓存抖动最小
   policy: "consistent_hash"
@@ -107,6 +108,14 @@ router:
 
   # 最大单请求体载荷字节数限制 (对应官方 --max-payload-size，默认 536870912 即 512MB)
   max_payload_size: 536870912
+
+  # 基于实例 /metrics 的队列感知与过载避让参数 (proxy 模式下生效):
+  # 当 consistent_hash / cache_aware 命中的主节点有效 waiting >= waiting_threshold 且存在更空闲节点时，
+  # 自动将该请求溢出调度到 waiting 最少的空闲实例 (默认 4，设为 0 可禁用过载避让)
+  waiting_threshold: 4
+  metrics_scrape_interval: 1s            # 定时抓取后端 <worker_url>/metrics 的间隔
+  metrics_scrape_timeout: 1500ms         # 单次抓取超时时间
+  worker_metrics_path: "/metrics"        # 后端实例暴露的 Prometheus 指标路径
 
 # ------------------------------------------------------------------------------
 # 5. Prefill-Decode (PD) 两阶段分离部署路由参数 (可选高级功能)

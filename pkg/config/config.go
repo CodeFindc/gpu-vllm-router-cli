@@ -57,6 +57,10 @@ type RouterConfig struct {
 	DecodeURLs                 []string      `yaml:"decode_urls,omitempty"`
 	APIKey                     string        `yaml:"api_key,omitempty"`
 	APIKeyValidationURLs       []string      `yaml:"api_key_validation_urls,omitempty"`
+	WaitingThreshold           *int          `yaml:"waiting_threshold,omitempty"`
+	MetricsScrapeInterval      time.Duration `yaml:"metrics_scrape_interval,omitempty"`
+	MetricsScrapeTimeout       time.Duration `yaml:"metrics_scrape_timeout,omitempty"`
+	WorkerMetricsPath          string        `yaml:"worker_metrics_path,omitempty"`
 	ExtraArgs                  []string      `yaml:"extra_args,omitempty"`
 }
 
@@ -117,6 +121,7 @@ type ModelRule struct {
 	BalanceAbsThreshold *int     `yaml:"balance_abs_threshold,omitempty" json:"balance_abs_threshold,omitempty"`
 	BalanceRelThreshold *float64 `yaml:"balance_rel_threshold,omitempty" json:"balance_rel_threshold,omitempty"`
 	CacheThreshold      *float64 `yaml:"cache_threshold,omitempty" json:"cache_threshold,omitempty"`
+	WaitingThreshold    *int     `yaml:"waiting_threshold,omitempty" json:"waiting_threshold,omitempty"`
 	LogDir              string   `yaml:"log_dir,omitempty" json:"log_dir,omitempty"`
 	ExtraArgs           []string `yaml:"extra_args,omitempty" json:"extra_args,omitempty"`
 }

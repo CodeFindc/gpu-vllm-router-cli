@@ -29,6 +29,14 @@ func TestBuildArgs(t *testing.T) {
 		t.Errorf("expected worker URLs in command, got %s", cmdStr)
 	}
 
+	// Verify least_waiting maps to power_of_two for external vllm-router CLI
+	lwCfg := cfg
+	lwCfg.Policy = PolicyLeastWaiting
+	lwArgs := strings.Join(BuildArgs(lwCfg), " ")
+	if !strings.Contains(lwArgs, "--policy power_of_two") {
+		t.Errorf("expected least_waiting to map to --policy power_of_two in CLI args, got %s", lwArgs)
+	}
+
 	bashCmd := GenerateBashCommand(cfg)
 	if !strings.HasPrefix(bashCmd, "vllm-router") {
 		t.Errorf("expected bash command to start with vllm-router, got %s", bashCmd)
@@ -53,6 +61,9 @@ func TestParsePolicy(t *testing.T) {
 		{"cache_aware", PolicyCacheAware, false},
 		{"power_of_two", PolicyPowerOfTwo, false},
 		{"p2c", PolicyPowerOfTwo, false},
+		{"least_waiting", PolicyLeastWaiting, false},
+		{"waiting", PolicyLeastWaiting, false},
+		{"min-waiting", PolicyLeastWaiting, false},
 		{"random", PolicyRandom, false},
 		{"rendezvous_hash", PolicyRendezvousHash, false},
 		{"invalid_policy", "", true},

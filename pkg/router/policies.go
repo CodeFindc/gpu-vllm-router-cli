@@ -13,6 +13,7 @@ const (
 	PolicyConsistentHash Policy = "consistent_hash"
 	PolicyRoundRobin     Policy = "round_robin"
 	PolicyPowerOfTwo     Policy = "power_of_two"
+	PolicyLeastWaiting   Policy = "least_waiting"
 	PolicyRandom         Policy = "random"
 	PolicyRendezvousHash Policy = "rendezvous_hash"
 )
@@ -58,6 +59,13 @@ func SupportedPolicies() []PolicyInfo {
 			LoadAware:       true,
 		},
 		{
+			Name:            PolicyLeastWaiting,
+			Description:     "Routes to the worker with fewest waiting/running requests from /metrics",
+			BestFor:         "Preventing queue buildup and head-of-line blocking across heterogeneous or bursty workloads",
+			SessionAffinity: false,
+			LoadAware:       true,
+		},
+		{
 			Name:            PolicyRandom,
 			Description:     "Uniform random distribution across workers",
 			BestFor:         "Simple deployments, stateless queries",
@@ -89,11 +97,13 @@ func ParsePolicy(s string) (Policy, error) {
 		return PolicyRoundRobin, nil
 	case PolicyPowerOfTwo, "p2c", "power_two":
 		return PolicyPowerOfTwo, nil
+	case PolicyLeastWaiting, "waiting", "min_waiting", "queue_aware":
+		return PolicyLeastWaiting, nil
 	case PolicyRandom, "rand":
 		return PolicyRandom, nil
 	case PolicyRendezvousHash, "hrw", "rendezvous":
 		return PolicyRendezvousHash, nil
 	default:
-		return "", fmt.Errorf("unknown load balancing policy: %q (supported: cache_aware, consistent_hash, round_robin, power_of_two, random, rendezvous_hash)", s)
+		return "", fmt.Errorf("unknown load balancing policy: %q (supported: cache_aware, consistent_hash, round_robin, power_of_two, least_waiting, random, rendezvous_hash)", s)
 	}
 }

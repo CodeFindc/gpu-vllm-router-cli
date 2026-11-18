@@ -102,7 +102,7 @@ func main() {
 	listModels := flag.Bool("list-models", false, "列出 GPUStack 当前所有已注册模型及其实例状态")
 
 	// Policy Flags
-	policyStr := flag.String("policy", "consistent_hash", "负载均衡策略: consistent_hash, round_robin, cache_aware, power_of_two, random, rendezvous_hash")
+	policyStr := flag.String("policy", "consistent_hash", "负载均衡策略: consistent_hash, round_robin, cache_aware, power_of_two, least_waiting, random, rendezvous_hash")
 	listPolicies := flag.Bool("list-policies", false, "显示所有受支持的负载均衡策略及其适用场景")
 
 	// Operating Mode
@@ -122,6 +122,10 @@ func main() {
 	balAbsThresh := flag.Int("balance-abs-threshold", 0, "vllm-router 负载绝对差均衡阈值 (如 4)")
 	balRelThresh := flag.Float64("balance-rel-threshold", 0.0, "vllm-router 负载相对比均衡阈值 (如 1.1)")
 	cacheThresh := flag.Float64("cache-threshold", 0.0, "vllm-router 前缀缓存命中复用阈值 (如 0.6)")
+	waitingThreshFlag := flag.Int("waiting-threshold", -1, "proxy 模式哈希策略 waiting 过载避让阈值 (-1 表示使用配置或默认 4，0 表示禁用)")
+	metricsScrapeIntervalFlag := flag.Duration("metrics-scrape-interval", 1*time.Second, "后端实例 /metrics 队列指标轮询采集间隔 (如 1s)")
+	metricsScrapeTimeoutFlag := flag.Duration("metrics-scrape-timeout", 1500*time.Millisecond, "后端实例 /metrics 单次采集超时时间")
+	workerMetricsPathFlag := flag.String("worker-metrics-path", "/metrics", "后端实例 Prometheus 指标路径 (默认 /metrics)")
 	evictionIntervalFlag := flag.Int("eviction-interval", 0, "前缀缓存淘汰间隔秒数 (如 120)")
 	maxTreeSizeFlag := flag.Int("max-tree-size", 0, "前缀缓存近似树最大容量 (如 67108864)")
 	maxPayloadSizeFlag := flag.Int("max-payload-size", 0, "最大请求体载荷字节大小 (如 536870912)")
@@ -265,6 +269,18 @@ func main() {
 		}
 		if !explicitFlags["worker-startup-check-interval"] && fileCfg.Router.WorkerStartupCheckInterval != nil {
 			*workerStartupCheckIntervalFlag = *fileCfg.Router.WorkerStartupCheckInterval
+		}
+		if !explicitFlags["waiting-threshold"] && fileCfg.Router.WaitingThreshold != nil {
+			*waitingThreshFlag = *fileCfg.Router.WaitingThreshold
+		}
+		if !explicitFlags["metrics-scrape-interval"] && fileCfg.Router.MetricsScrapeInterval > 0 {
+			*metricsScrapeIntervalFlag = fileCfg.Router.MetricsScrapeInterval
+		}
+		if !explicitFlags["metrics-scrape-timeout"] && fileCfg.Router.MetricsScrapeTimeout > 0 {
+			*metricsScrapeTimeoutFlag = fileCfg.Router.MetricsScrapeTimeout
+		}
+		if !explicitFlags["worker-metrics-path"] && fileCfg.Router.WorkerMetricsPath != "" {
+			*workerMetricsPathFlag = fileCfg.Router.WorkerMetricsPath
 		}
 	}
 
@@ -614,16 +630,26 @@ func main() {
 		supRouterCfg := routerCfg
 		supRouterCfg.WorkerURLs = staticWorkerURLs
 
+		var waitingThreshPtr *int
+		if *waitingThreshFlag >= 0 {
+			v := *waitingThreshFlag
+			waitingThreshPtr = &v
+		}
+
 		supCfg := router.SupervisorConfig{
-			ZeroDowntime:   *zeroDowntime,
-			PublicHost:     *host,
-			PublicPort:     *port,
-			MetricsPort:    *metricsPort,
-			DrainTimeout:   *drainTimeout,
-			WatchInterval:  *watchInterval,
-			RouterCfg:      supRouterCfg,
-			ConfigFilePath: resolvedConfigPath,
-			ModelRules:     modelRules,
+			ZeroDowntime:          *zeroDowntime,
+			PublicHost:            *host,
+			PublicPort:            *port,
+			MetricsPort:           *metricsPort,
+			DrainTimeout:          *drainTimeout,
+			WatchInterval:         *watchInterval,
+			WaitingThreshold:      waitingThreshPtr,
+			MetricsScrapeInterval: *metricsScrapeIntervalFlag,
+			MetricsScrapeTimeout:  *metricsScrapeTimeoutFlag,
+			WorkerMetricsPath:     *workerMetricsPathFlag,
+			RouterCfg:             supRouterCfg,
+			ConfigFilePath:        resolvedConfigPath,
+			ModelRules:            modelRules,
 		}
 		if fileCfg != nil {
 			if fileCfg.CircuitBreaker.HealthCheckInterval > 0 {
@@ -684,28 +710,37 @@ func main() {
 		if *cacheThresh > 0 {
 			cacheThreshPtr = cacheThresh
 		}
+		var waitingThreshPtr *int
+		if *waitingThreshFlag >= 0 {
+			v := *waitingThreshFlag
+			waitingThreshPtr = &v
+		}
 
 		proxyCfg := proxy.ServerConfig{
-			Host:                *host,
-			Port:                *port,
-			MetricsPort:         *metricsPort,
-			Policy:              selectedPolicy,
-			ModelName:           *modelName,
-			StaticWorkerURLs:    staticWorkerURLs,
-			WatchInterval:       *watchInterval,
-			CircuitBreaker:      cbCfg,
-			ConfigFilePath:      resolvedConfigPath,
-			ModelRules:          modelRules,
-			ZeroDowntime:        *zeroDowntime,
-			DrainTimeout:        *drainTimeout,
-			BalanceAbsThreshold: balAbsPtr,
-			BalanceRelThreshold: balRelPtr,
-			CacheThreshold:      cacheThreshPtr,
-			ExtraArgs:           routerCfg.ExtraArgs,
-			RouterBin:           *routerBin,
-			Backend:             *backendFlag,
-			LogLevel:            *logLevelFlag,
-			LogDir:              *logDirFlag,
+			Host:                  *host,
+			Port:                  *port,
+			MetricsPort:           *metricsPort,
+			Policy:                selectedPolicy,
+			ModelName:             *modelName,
+			StaticWorkerURLs:      staticWorkerURLs,
+			WatchInterval:         *watchInterval,
+			CircuitBreaker:        cbCfg,
+			ConfigFilePath:        resolvedConfigPath,
+			ModelRules:            modelRules,
+			ZeroDowntime:          *zeroDowntime,
+			DrainTimeout:          *drainTimeout,
+			BalanceAbsThreshold:   balAbsPtr,
+			BalanceRelThreshold:   balRelPtr,
+			CacheThreshold:        cacheThreshPtr,
+			WaitingThreshold:      waitingThreshPtr,
+			MetricsScrapeInterval: *metricsScrapeIntervalFlag,
+			MetricsScrapeTimeout:  *metricsScrapeTimeoutFlag,
+			WorkerMetricsPath:     *workerMetricsPathFlag,
+			ExtraArgs:             routerCfg.ExtraArgs,
+			RouterBin:             *routerBin,
+			Backend:               *backendFlag,
+			LogLevel:              *logLevelFlag,
+			LogDir:                *logDirFlag,
 		}
 		if fileCfg != nil {
 			proxyCfg.AutoHeal = fileCfg.AutoHeal

@@ -16,15 +16,49 @@ import (
 
 	"gpu-vllm-router/pkg/logger"
 	"gpu-vllm-router/pkg/router"
+	"gpu-vllm-router/pkg/workermetrics"
 )
+
+// DefaultWaitingThreshold is the default waiting queue threshold before hash-based policies divert to an emptier worker.
+const DefaultWaitingThreshold = 4
 
 // BackendTarget represents a single worker node endpoint.
 type BackendTarget struct {
 	URL            *url.URL
 	URLString      string
 	ActiveConns    int64
+	ActiveAtScrape int64
 	Healthy        bool
 	CircuitBreaker *CircuitBreaker
+	MetricsStore   *workermetrics.Store
+}
+
+// SnapshotActiveAtScrape records the current ActiveConns at the moment /metrics was scraped.
+func (t *BackendTarget) SnapshotActiveAtScrape() {
+	if t == nil {
+		return
+	}
+	atomic.StoreInt64(&t.ActiveAtScrape, atomic.LoadInt64(&t.ActiveConns))
+}
+
+// EffectiveLoad returns the target's effective waiting/running request counts and local active connections.
+// Between /metrics scrapes, positive local ActiveConns deltas are added to prevent burst pile-ups.
+// If /metrics is unavailable or stale, it falls back to ActiveConns.
+func (t *BackendTarget) EffectiveLoad() (waiting, running float64, active int64, metricsOK bool) {
+	if t == nil {
+		return 0, 0, 0, false
+	}
+	active = atomic.LoadInt64(&t.ActiveConns)
+	if t.MetricsStore != nil {
+		if m, ok := t.MetricsStore.Get(t.URLString); ok {
+			delta := active - atomic.LoadInt64(&t.ActiveAtScrape)
+			if delta < 0 {
+				delta = 0
+			}
+			return m.Waiting + float64(delta), m.Running + float64(delta), active, true
+		}
+	}
+	return float64(active), float64(active), active, false
 }
 
 // Balancer is the interface for load balancing algorithms.
@@ -185,20 +219,102 @@ func (b *PowerOfTwoBalancer) SelectTargetExcluding(r *http.Request, excluded map
 	t1 := available[i1]
 	t2 := available[i2]
 
-	// Choose the one with fewer active connections
-	if atomic.LoadInt64(&t1.ActiveConns) <= atomic.LoadInt64(&t2.ActiveConns) {
+	// Choose the one with lower effective load (waiting, running, activeConns)
+	w1, r1, a1, _ := t1.EffectiveLoad()
+	w2, r2, a2, _ := t2.EffectiveLoad()
+	if !isLoadGreater(w1, r1, a1, w2, r2, a2) {
 		return t1, nil
 	}
 	return t2, nil
+}
+
+// isLoadLess returns true if load (w1, r1, a1) is strictly less than (w2, r2, a2).
+func isLoadLess(w1, r1 float64, a1 int64, w2, r2 float64, a2 int64) bool {
+	if w1 != w2 {
+		return w1 < w2
+	}
+	if r1 != r2 {
+		return r1 < r2
+	}
+	return a1 < a2
+}
+
+// isLoadGreater returns true if load (w1, r1, a1) is strictly greater than (w2, r2, a2).
+func isLoadGreater(w1, r1 float64, a1 int64, w2, r2 float64, a2 int64) bool {
+	return isLoadLess(w2, r2, a2, w1, r1, a1)
+}
+
+// selectLeastWaitingTarget selects the target with minimum (effectiveWaiting, effectiveRunning, activeConns).
+// Ties are broken evenly by scanning from an atomic round-robin cursor.
+func selectLeastWaitingTarget(available []*BackendTarget, rrCursor *uint64) (*BackendTarget, float64, float64, int64) {
+	n := len(available)
+	if n == 0 {
+		return nil, 0, 0, 0
+	}
+	start := 0
+	if rrCursor != nil && n > 1 {
+		start = int(atomic.AddUint64(rrCursor, 1) % uint64(n))
+	}
+
+	best := available[start]
+	bestW, bestR, bestA, _ := best.EffectiveLoad()
+
+	for i := 1; i < n; i++ {
+		cand := available[(start+i)%n]
+		w, r, a, _ := cand.EffectiveLoad()
+		if isLoadLess(w, r, a, bestW, bestR, bestA) {
+			best = cand
+			bestW, bestR, bestA = w, r, a
+		}
+	}
+	return best, bestW, bestR, bestA
+}
+
+// --- Least Waiting Balancer ---
+
+// LeastWaitingBalancer routes requests to the healthy worker with the fewest waiting/running requests.
+type LeastWaitingBalancer struct {
+	BaseBalancer
+	rrCursor uint64
+}
+
+func NewLeastWaitingBalancer(targets []*BackendTarget) *LeastWaitingBalancer {
+	b := &LeastWaitingBalancer{}
+	b.SetTargets(targets)
+	return b
+}
+
+func (b *LeastWaitingBalancer) SelectTarget(r *http.Request) (*BackendTarget, error) {
+	return b.SelectTargetExcluding(r, nil)
+}
+
+func (b *LeastWaitingBalancer) SelectTargetExcluding(r *http.Request, excluded map[string]bool) (*BackendTarget, error) {
+	b.mu.RLock()
+	defer b.mu.RUnlock()
+
+	available := b.getAvailableTargets(excluded)
+	if len(available) == 0 {
+		if len(excluded) > 0 {
+			return nil, errors.New("no alternative healthy backends available for failover")
+		}
+		return nil, errors.New("all backends are currently isolated by circuit breaker (OPEN)")
+	}
+
+	best, bestW, bestR, bestA := selectLeastWaitingTarget(available, &b.rrCursor)
+	logger.Debugf("[Balancer:LeastWaiting] 🎯 Routed to worker %s (Waiting: %.0f, Running: %.0f, Active: %d)",
+		best.URLString, bestW, bestR, bestA)
+	return best, nil
 }
 
 // --- Consistent Hash Balancer ---
 
 type ConsistentHashBalancer struct {
 	BaseBalancer
-	virtualNodes int
-	ring         []uint32
-	ringMap      map[uint32]*BackendTarget
+	virtualNodes     int
+	ring             []uint32
+	ringMap          map[uint32]*BackendTarget
+	waitingThreshold int
+	divertCursor     uint64
 }
 
 func NewConsistentHashBalancer(targets []*BackendTarget, virtualNodes int) *ConsistentHashBalancer {
@@ -206,11 +322,44 @@ func NewConsistentHashBalancer(targets []*BackendTarget, virtualNodes int) *Cons
 		virtualNodes = 100
 	}
 	b := &ConsistentHashBalancer{
-		virtualNodes: virtualNodes,
-		ringMap:      make(map[uint32]*BackendTarget),
+		virtualNodes:     virtualNodes,
+		ringMap:          make(map[uint32]*BackendTarget),
+		waitingThreshold: DefaultWaitingThreshold,
 	}
 	b.SetTargets(targets)
 	return b
+}
+
+// SetWaitingThreshold sets the waiting queue threshold above which hash routing diverts to a less loaded worker.
+// Setting threshold <= 0 disables waiting-based overload diversion.
+func (b *ConsistentHashBalancer) SetWaitingThreshold(threshold int) {
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	b.waitingThreshold = threshold
+}
+
+// divertIfOverloaded checks whether the primary hash target is overloaded (effectiveWaiting >= waitingThreshold)
+// and diverts to the least-waiting healthy worker if one has strictly lower waiting count.
+func (b *ConsistentHashBalancer) divertIfOverloaded(primary *BackendTarget, excluded map[string]bool, policyName string) *BackendTarget {
+	if primary == nil || b.waitingThreshold <= 0 {
+		return primary
+	}
+	pWait, pRun, _, ok := primary.EffectiveLoad()
+	if !ok || pWait < float64(b.waitingThreshold) {
+		return primary
+	}
+
+	available := b.getAvailableTargets(excluded)
+	if len(available) <= 1 {
+		return primary
+	}
+	alt, altWait, altRun, altAct := selectLeastWaitingTarget(available, &b.divertCursor)
+	if alt != nil && alt.URLString != primary.URLString && altWait < pWait {
+		logger.Debugf("[Balancer:%s] ⚡ Overload diversion: primary %s (Waiting: %.0f, Running: %.0f >= threshold %d) -> diverted to %s (Waiting: %.0f, Running: %.0f, Active: %d)",
+			policyName, primary.URLString, pWait, pRun, b.waitingThreshold, alt.URLString, altWait, altRun, altAct)
+		return alt
+	}
+	return primary
 }
 
 func (b *ConsistentHashBalancer) SetTargets(targets []*BackendTarget) {
@@ -264,9 +413,10 @@ func (b *ConsistentHashBalancer) SelectTargetExcluding(r *http.Request, excluded
 			continue
 		}
 		if target.CircuitBreaker == nil || target.CircuitBreaker.CanExecute() {
+			chosen := b.divertIfOverloaded(target, excluded, "ConsistentHash")
 			logger.Debugf("[Balancer:ConsistentHash] 🎯 Routed to worker %s (Active: %d) | SessionKey: %q (hash=0x%08x)",
-				target.URLString, atomic.LoadInt64(&target.ActiveConns), key, h)
-			return target, nil
+				chosen.URLString, atomic.LoadInt64(&chosen.ActiveConns), key, h)
+			return chosen, nil
 		}
 	}
 
@@ -409,9 +559,10 @@ func (b *CacheAwareBalancer) SelectTargetExcluding(r *http.Request, excluded map
 			continue
 		}
 		if target.CircuitBreaker == nil || target.CircuitBreaker.CanExecute() {
+			chosen := b.divertIfOverloaded(target, excluded, "CacheAware")
 			logger.Debugf("[Balancer:CacheAware] 🎯 Routed to %s (Active: %d) | Key: [%s] hash=0x%08x len=%d sample=%q",
-				target.URLString, atomic.LoadInt64(&target.ActiveConns), info.Source, info.Hash, info.KeyLength, info.KeyPreview)
-			return target, nil
+				chosen.URLString, atomic.LoadInt64(&chosen.ActiveConns), info.Source, info.Hash, info.KeyLength, info.KeyPreview)
+			return chosen, nil
 		}
 	}
 
@@ -577,13 +728,20 @@ func DescribeRoutingKey(policy router.Policy, r *http.Request) string {
 	case router.PolicyCacheAware:
 		info := extractCacheAwareKeyInfo(r)
 		return fmt.Sprintf("[%s] hash=0x%08x len=%d sample=%q", info.Source, info.Hash, info.KeyLength, info.KeyPreview)
+	case router.PolicyLeastWaiting:
+		return "least_waiting"
 	default:
 		return string(policy)
 	}
 }
 
-// NewBalancer creates a Balancer based on Policy.
+// NewBalancer creates a Balancer based on Policy using the default waiting threshold.
 func NewBalancer(policy router.Policy, targets []*BackendTarget) Balancer {
+	return NewBalancerWithWaitingThreshold(policy, targets, DefaultWaitingThreshold)
+}
+
+// NewBalancerWithWaitingThreshold creates a Balancer with an explicit waiting overload diversion threshold.
+func NewBalancerWithWaitingThreshold(policy router.Policy, targets []*BackendTarget, waitingThreshold int) Balancer {
 	switch policy {
 	case router.PolicyRoundRobin:
 		return NewRoundRobinBalancer(targets)
@@ -591,10 +749,16 @@ func NewBalancer(policy router.Policy, targets []*BackendTarget) Balancer {
 		return NewRandomBalancer(targets)
 	case router.PolicyPowerOfTwo:
 		return NewPowerOfTwoBalancer(targets)
+	case router.PolicyLeastWaiting:
+		return NewLeastWaitingBalancer(targets)
 	case router.PolicyConsistentHash:
-		return NewConsistentHashBalancer(targets, 100)
+		ch := NewConsistentHashBalancer(targets, 100)
+		ch.SetWaitingThreshold(waitingThreshold)
+		return ch
 	case router.PolicyCacheAware:
-		return NewCacheAwareBalancer(targets, 100)
+		ca := NewCacheAwareBalancer(targets, 100)
+		ca.SetWaitingThreshold(waitingThreshold)
+		return ca
 	case router.PolicyRendezvousHash:
 		return NewRendezvousHashBalancer(targets)
 	default:

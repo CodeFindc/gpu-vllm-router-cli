@@ -1,13 +1,18 @@
 package proxy
 
 import (
+	"context"
+	"fmt"
 	"net/http"
+	"net/http/httptest"
 	"net/url"
 	"strings"
 	"sync/atomic"
 	"testing"
+	"time"
 
 	"gpu-vllm-router/pkg/router"
+	"gpu-vllm-router/pkg/workermetrics"
 )
 
 func makeTargets(urls ...string) []*BackendTarget {
@@ -170,5 +175,173 @@ func TestCacheAwareBalancer(t *testing.T) {
 	targetH2, _ := b.SelectTarget(reqHeader)
 	if targetH1.URLString != targetH2.URLString {
 		t.Fatalf("Header fallback consistency broken: %s vs %s", targetH1.URLString, targetH2.URLString)
+	}
+}
+
+func newMockWorkerMetricsServer(running, waiting *int64) *httptest.Server {
+	return httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Path == "/metrics" {
+			fmt.Fprintf(w, "vllm:num_requests_running %d\nvllm:num_requests_waiting %d\n",
+				atomic.LoadInt64(running), atomic.LoadInt64(waiting))
+			return
+		}
+		w.WriteHeader(http.StatusOK)
+	}))
+}
+
+func TestLeastWaitingBalancer(t *testing.T) {
+	var r1, w1 int64 = 12, 20 // Heavily overloaded worker (running=12, waiting=20)
+	var r2, w2 int64 = 0, 0   // Idle
+	var r3, w3 int64 = 2, 0   // Slightly busy running, 0 waiting
+	var r4, w4 int64 = 0, 0   // Idle
+
+	s1 := newMockWorkerMetricsServer(&r1, &w1)
+	defer s1.Close()
+	s2 := newMockWorkerMetricsServer(&r2, &w2)
+	defer s2.Close()
+	s3 := newMockWorkerMetricsServer(&r3, &w3)
+	defer s3.Close()
+	s4 := newMockWorkerMetricsServer(&r4, &w4)
+	defer s4.Close()
+
+	store := workermetrics.NewStore(workermetrics.Config{
+		ScrapeInterval: 50 * time.Millisecond,
+		ScrapeTimeout:  time.Second,
+	})
+	urls := []string{s1.URL, s2.URL, s3.URL, s4.URL}
+	store.SetWorkerURLs(urls)
+	store.ScrapeOnce(context.Background())
+
+	targets := makeTargets(urls...)
+	for _, tgt := range targets {
+		tgt.MetricsStore = store
+		tgt.SnapshotActiveAtScrape()
+	}
+
+	b := NewLeastWaitingBalancer(targets)
+	req, _ := http.NewRequest(http.MethodPost, "http://localhost/v1/chat/completions", nil)
+
+	// 1. First request must pick one of the idle workers (s2 or s4, both waiting=0 running=0), never s1 or s3
+	chosen1, err := b.SelectTarget(req)
+	if err != nil {
+		t.Fatalf("SelectTarget error: %v", err)
+	}
+	if chosen1.URLString != s2.URL && chosen1.URLString != s4.URL {
+		t.Errorf("expected idle worker s2 or s4, got %s", chosen1.URLString)
+	}
+
+	// 2. Simulate burst between scrapes: RecordRequestStart increments ActiveConns -> delta prevents piling onto same node
+	b.RecordRequestStart(chosen1)
+	chosen2, err := b.SelectTarget(req)
+	if err != nil {
+		t.Fatalf("SelectTarget 2 error: %v", err)
+	}
+	if chosen2.URLString == chosen1.URLString {
+		t.Errorf("expected burst anti-herding to pick the other idle worker, got %s again", chosen2.URLString)
+	}
+	if chosen2.URLString != s2.URL && chosen2.URLString != s4.URL {
+		t.Errorf("expected the other idle worker, got %s", chosen2.URLString)
+	}
+
+	// 3. Occupy s2 and s4 locally; next request should go to s3 (waiting=0, running=2), NOT s1 (waiting=20)
+	b.RecordRequestStart(chosen2)
+	for i := 0; i < 4; i++ {
+		// Make s2 and s4 have effective waiting=3 (0 + 3 delta) so s3 (waiting=0, running=2) is strictly better
+		b.RecordRequestStart(targets[1])
+		b.RecordRequestStart(targets[3])
+	}
+	chosen3, err := b.SelectTarget(req)
+	if err != nil {
+		t.Fatalf("SelectTarget 3 error: %v", err)
+	}
+	if chosen3.URLString != s3.URL {
+		t.Errorf("expected s3 (waiting=0, running=2), got %s", chosen3.URLString)
+	}
+	if chosen3.URLString == s1.URL {
+		t.Errorf("must never route to overloaded s1 (waiting=20)")
+	}
+}
+
+func TestLeastWaitingBalancer_FallbackWithoutMetrics(t *testing.T) {
+	targets := makeTargets("http://w1:8000", "http://w2:8000")
+	atomic.StoreInt64(&targets[0].ActiveConns, 5)
+	atomic.StoreInt64(&targets[1].ActiveConns, 1)
+
+	b := NewLeastWaitingBalancer(targets)
+	req, _ := http.NewRequest(http.MethodGet, "http://localhost/v1/models", nil)
+
+	chosen, err := b.SelectTarget(req)
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if chosen.URLString != "http://w2:8000" {
+		t.Errorf("expected fallback to lower ActiveConns w2, got %s", chosen.URLString)
+	}
+}
+
+func TestConsistentHashAndCacheAwareWaitingDiversion(t *testing.T) {
+	var r1, w1 int64 = 12, 20
+	var r2, w2 int64 = 0, 0
+	var r3, w3 int64 = 5, 20
+	var r4, w4 int64 = 8, 20
+
+	s1 := newMockWorkerMetricsServer(&r1, &w1)
+	defer s1.Close()
+	s2 := newMockWorkerMetricsServer(&r2, &w2)
+	defer s2.Close()
+	s3 := newMockWorkerMetricsServer(&r3, &w3)
+	defer s3.Close()
+	s4 := newMockWorkerMetricsServer(&r4, &w4)
+	defer s4.Close()
+
+	store := workermetrics.NewStore(workermetrics.Config{ScrapeInterval: 50 * time.Millisecond})
+	urls := []string{s1.URL, s2.URL, s3.URL, s4.URL}
+	store.SetWorkerURLs(urls)
+	store.ScrapeOnce(context.Background())
+
+	targets := makeTargets(urls...)
+	for _, tgt := range targets {
+		tgt.MetricsStore = store
+	}
+
+	// ConsistentHash with threshold=4: any overloaded primary (waiting=20 >= 4) must divert to idle s2 (waiting=0)
+	ch := NewConsistentHashBalancer(targets, 100)
+	ch.SetWaitingThreshold(4)
+
+	req, _ := http.NewRequest(http.MethodPost, "http://localhost/v1/chat/completions", nil)
+	req.Header.Set("X-Session-ID", "heavy-session-1")
+	chosen, err := ch.SelectTarget(req)
+	if err != nil {
+		t.Fatalf("ConsistentHash SelectTarget failed: %v", err)
+	}
+	if chosen.URLString != s2.URL {
+		t.Errorf("expected diversion to idle s2, got %s", chosen.URLString)
+	}
+
+	// CacheAware with threshold=4: overloaded primary must divert to idle s2
+	ca := NewCacheAwareBalancer(targets, 100)
+	ca.SetWaitingThreshold(4)
+	body := `{"model": "qwen", "messages": [{"role": "user", "content": "shared prefix overload test"}]}`
+	reqCA, _ := http.NewRequest(http.MethodPost, "http://localhost/v1/chat/completions", strings.NewReader(body))
+	chosenCA, err := ca.SelectTarget(reqCA)
+	if err != nil {
+		t.Fatalf("CacheAware SelectTarget failed: %v", err)
+	}
+	if chosenCA.URLString != s2.URL {
+		t.Errorf("expected CacheAware diversion to idle s2, got %s", chosenCA.URLString)
+	}
+
+	// When all nodes have waiting=20 (none less loaded), preserve primary affinity (no needless jitter)
+	atomic.StoreInt64(&w2, 20)
+	store.ScrapeOnce(context.Background())
+	ca.SetWaitingThreshold(0) // find primary without diversion
+	primaryReq, _ := http.NewRequest(http.MethodPost, "http://localhost/v1/chat/completions", strings.NewReader(body))
+	expectedPrimary, _ := ca.SelectTarget(primaryReq)
+
+	ca.SetWaitingThreshold(4)
+	reqAllBusy, _ := http.NewRequest(http.MethodPost, "http://localhost/v1/chat/completions", strings.NewReader(body))
+	chosenAllBusy, _ := ca.SelectTarget(reqAllBusy)
+	if chosenAllBusy.URLString != expectedPrimary.URLString {
+		t.Errorf("when all workers equally busy (waiting=20), expected affinity to %s, got %s", expectedPrimary.URLString, chosenAllBusy.URLString)
 	}
 }

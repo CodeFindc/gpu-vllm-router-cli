@@ -410,4 +410,45 @@ models:
 	}
 }
 
+func TestLoadConfigWithWaitingSchedulingFields(t *testing.T) {
+	yamlContent := `
+target:
+  policy: "least_waiting"
+router:
+  mode: "proxy"
+  waiting_threshold: 6
+  metrics_scrape_interval: 2s
+  metrics_scrape_timeout: 1s
+  worker_metrics_path: "/metrics"
+models:
+  - model_name: "DeepSeek-V4"
+    policy: "consistent_hash"
+    waiting_threshold: 3
+`
+	tmpFile := filepath.Join(t.TempDir(), "config.yaml")
+	if err := os.WriteFile(tmpFile, []byte(yamlContent), 0644); err != nil {
+		t.Fatalf("failed to write temp config: %v", err)
+	}
+
+	cfg, err := LoadConfig(tmpFile)
+	if err != nil {
+		t.Fatalf("LoadConfig failed: %v", err)
+	}
+	if cfg.Target.Policy != "least_waiting" {
+		t.Errorf("expected least_waiting, got %s", cfg.Target.Policy)
+	}
+	if cfg.Router.WaitingThreshold == nil || *cfg.Router.WaitingThreshold != 6 {
+		t.Errorf("expected router.waiting_threshold=6, got %v", cfg.Router.WaitingThreshold)
+	}
+	if cfg.Router.MetricsScrapeInterval != 2*time.Second || cfg.Router.MetricsScrapeTimeout != 1*time.Second {
+		t.Errorf("unexpected scrape durations: interval=%v timeout=%v", cfg.Router.MetricsScrapeInterval, cfg.Router.MetricsScrapeTimeout)
+	}
+	if cfg.Router.WorkerMetricsPath != "/metrics" {
+		t.Errorf("expected worker_metrics_path=/metrics, got %s", cfg.Router.WorkerMetricsPath)
+	}
+	if len(cfg.Models) != 1 || cfg.Models[0].WaitingThreshold == nil || *cfg.Models[0].WaitingThreshold != 3 {
+		t.Errorf("expected model waiting_threshold=3, got %+v", cfg.Models)
+	}
+}
+
 

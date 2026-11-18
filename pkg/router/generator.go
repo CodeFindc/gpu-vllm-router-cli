@@ -83,6 +83,10 @@ func BuildArgs(cfg Config) []string {
 	if policy == "" {
 		policy = PolicyConsistentHash
 	}
+	// External vllm-router binary does not support Go's least_waiting policy; fallback to power_of_two for CLI generation.
+	if policy == PolicyLeastWaiting {
+		policy = PolicyPowerOfTwo
+	}
 	args = append(args, "--policy", string(policy))
 
 	if cfg.DataParallelSize > 1 {

@@ -29,13 +29,17 @@ type ModelTopology struct {
 
 // WorkerTopology represents the real-time load, health, and circuit breaker status of a backend worker.
 type WorkerTopology struct {
-	URL                 string `json:"url"`
-	ActiveConns         int64  `json:"active_conns"`
-	Healthy             bool   `json:"healthy"`
-	CircuitState        string `json:"circuit_state"` // "CLOSED", "OPEN", "HALF_OPEN"
-	ConsecutiveFailures int    `json:"consecutive_failures"`
-	LastErr             string `json:"last_error,omitempty"`
-	LastProbe           string `json:"last_probe,omitempty"`
+	URL                 string  `json:"url"`
+	ActiveConns         int64   `json:"active_conns"`
+	RunningRequests     float64 `json:"running_requests"`
+	WaitingRequests     float64 `json:"waiting_requests"`
+	KVCacheUsage        float64 `json:"kv_cache_usage,omitempty"`
+	MetricsAvailable    bool    `json:"metrics_available"`
+	Healthy             bool    `json:"healthy"`
+	CircuitState        string  `json:"circuit_state"` // "CLOSED", "OPEN", "HALF_OPEN"
+	ConsecutiveFailures int     `json:"consecutive_failures"`
+	LastErr             string  `json:"last_error,omitempty"`
+	LastProbe           string  `json:"last_probe,omitempty"`
 }
 
 // ProbeRequest represents the payload for triggering a manual worker probe.
@@ -71,50 +75,55 @@ type ModelRuleDTO struct {
 	BalanceAbsThreshold *int     `json:"balance_abs_threshold,omitempty"`
 	BalanceRelThreshold *float64 `json:"balance_rel_threshold,omitempty"`
 	CacheThreshold      *float64 `json:"cache_threshold,omitempty"`
+	WaitingThreshold    *int     `json:"waiting_threshold,omitempty"`
 	ExtraArgs           []string `json:"extra_args,omitempty"`
 }
 
 // ConfigSnapshot represents the current active system configuration for dashboard viewing and editing.
 type ConfigSnapshot struct {
-	Mode                    string         `json:"mode"`                       // Global mode: "proxy" or "run"
-	Policy                  string         `json:"policy"`                     // Global policy
-	WatchIntervalSecs       int            `json:"watch_interval_secs"`        // e.g. 10
-	ZeroDowntime            bool           `json:"zero_downtime"`              // true/false
-	DrainTimeoutSecs        int            `json:"drain_timeout_secs"`         // e.g. 60
-	BalanceAbsThreshold     *int           `json:"balance_abs_threshold,omitempty"`
-	BalanceRelThreshold     *float64       `json:"balance_rel_threshold,omitempty"`
-	CacheThreshold          *float64       `json:"cache_threshold,omitempty"`
-	ExtraArgs               []string       `json:"extra_args,omitempty"`
-	CircuitBreakerEnabled   bool           `json:"circuit_breaker_enabled"`    // true/false
-	MaxFailures             int            `json:"max_failures"`               // e.g. 3
-	CooldownSecs            int            `json:"cooldown_secs"`              // e.g. 10
-	MaxRetries              int            `json:"max_retries"`                // e.g. 2
-	HealthCheckIntervalSecs int            `json:"health_check_interval_secs"` // e.g. 3
-	SuccessThreshold        int            `json:"success_threshold"`          // e.g. 2
-	Models                  []ModelRuleDTO `json:"models"`                     // Custom per-model rules
-	AvailablePolicies       []string       `json:"available_policies"`         // 6 supported policies
-	AvailableModes          []string       `json:"available_modes"`            // ["proxy", "run"]
-	ConfigFilePath          string         `json:"config_file_path"`           // e.g. "config.yaml"
+	Mode                      string         `json:"mode"`                       // Global mode: "proxy" or "run"
+	Policy                    string         `json:"policy"`                     // Global policy
+	WatchIntervalSecs         int            `json:"watch_interval_secs"`        // e.g. 10
+	ZeroDowntime              bool           `json:"zero_downtime"`              // true/false
+	DrainTimeoutSecs          int            `json:"drain_timeout_secs"`         // e.g. 60
+	BalanceAbsThreshold       *int           `json:"balance_abs_threshold,omitempty"`
+	BalanceRelThreshold       *float64       `json:"balance_rel_threshold,omitempty"`
+	CacheThreshold            *float64       `json:"cache_threshold,omitempty"`
+	WaitingThreshold          *int           `json:"waiting_threshold,omitempty"`
+	MetricsScrapeIntervalSecs *int           `json:"metrics_scrape_interval_secs,omitempty"`
+	ExtraArgs                 []string       `json:"extra_args,omitempty"`
+	CircuitBreakerEnabled     bool           `json:"circuit_breaker_enabled"`    // true/false
+	MaxFailures               int            `json:"max_failures"`               // e.g. 3
+	CooldownSecs              int            `json:"cooldown_secs"`              // e.g. 10
+	MaxRetries                int            `json:"max_retries"`                // e.g. 2
+	HealthCheckIntervalSecs   int            `json:"health_check_interval_secs"` // e.g. 3
+	SuccessThreshold          int            `json:"success_threshold"`          // e.g. 2
+	Models                    []ModelRuleDTO `json:"models"`                     // Custom per-model rules
+	AvailablePolicies         []string       `json:"available_policies"`         // 7 supported policies
+	AvailableModes            []string       `json:"available_modes"`            // ["proxy", "run"]
+	ConfigFilePath            string         `json:"config_file_path"`           // e.g. "config.yaml"
 }
 
 // ConfigUpdateRequest contains fields to update system configuration.
 type ConfigUpdateRequest struct {
-	Mode                    *string        `json:"mode,omitempty"`
-	Policy                  *string        `json:"policy,omitempty"`
-	WatchIntervalSecs       *int           `json:"watch_interval_secs,omitempty"`
-	ZeroDowntime            *bool          `json:"zero_downtime,omitempty"`
-	DrainTimeoutSecs        *int           `json:"drain_timeout_secs,omitempty"`
-	BalanceAbsThreshold     *int           `json:"balance_abs_threshold,omitempty"`
-	BalanceRelThreshold     *float64       `json:"balance_rel_threshold,omitempty"`
-	CacheThreshold          *float64       `json:"cache_threshold,omitempty"`
-	ExtraArgs               []string       `json:"extra_args,omitempty"`
-	CircuitBreakerEnabled   *bool          `json:"circuit_breaker_enabled,omitempty"`
-	MaxFailures             *int           `json:"max_failures,omitempty"`
-	CooldownSecs            *int           `json:"cooldown_secs,omitempty"`
-	MaxRetries              *int           `json:"max_retries,omitempty"`
-	HealthCheckIntervalSecs *int           `json:"health_check_interval_secs,omitempty"`
-	SuccessThreshold        *int           `json:"success_threshold,omitempty"`
-	Models                  []ModelRuleDTO `json:"models,omitempty"`
+	Mode                      *string        `json:"mode,omitempty"`
+	Policy                    *string        `json:"policy,omitempty"`
+	WatchIntervalSecs         *int           `json:"watch_interval_secs,omitempty"`
+	ZeroDowntime              *bool          `json:"zero_downtime,omitempty"`
+	DrainTimeoutSecs          *int           `json:"drain_timeout_secs,omitempty"`
+	BalanceAbsThreshold       *int           `json:"balance_abs_threshold,omitempty"`
+	BalanceRelThreshold       *float64       `json:"balance_rel_threshold,omitempty"`
+	CacheThreshold            *float64       `json:"cache_threshold,omitempty"`
+	WaitingThreshold          *int           `json:"waiting_threshold,omitempty"`
+	MetricsScrapeIntervalSecs *int           `json:"metrics_scrape_interval_secs,omitempty"`
+	ExtraArgs                 []string       `json:"extra_args,omitempty"`
+	CircuitBreakerEnabled     *bool          `json:"circuit_breaker_enabled,omitempty"`
+	MaxFailures               *int           `json:"max_failures,omitempty"`
+	CooldownSecs              *int           `json:"cooldown_secs,omitempty"`
+	MaxRetries                *int           `json:"max_retries,omitempty"`
+	HealthCheckIntervalSecs   *int           `json:"health_check_interval_secs,omitempty"`
+	SuccessThreshold          *int           `json:"success_threshold,omitempty"`
+	Models                    []ModelRuleDTO `json:"models,omitempty"`
 }
 
 // ModelRuleUpdateRequest updates mode and/or policy for a specific model.
@@ -126,6 +135,7 @@ type ModelRuleUpdateRequest struct {
 	BalanceAbsThreshold *int     `json:"balance_abs_threshold,omitempty"`
 	BalanceRelThreshold *float64 `json:"balance_rel_threshold,omitempty"`
 	CacheThreshold      *float64 `json:"cache_threshold,omitempty"`
+	WaitingThreshold    *int     `json:"waiting_threshold,omitempty"`
 	ExtraArgs           []string `json:"extra_args,omitempty"`
 }
 

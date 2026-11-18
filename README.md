@@ -25,7 +25,7 @@
 
 - [一、核心架构与系统拓扑](#一核心架构与系统拓扑)
 - [二、主要功能特性](#二主要功能特性)
-- [三、六大负载均衡策略详解](#三六大负载均衡策略详解)
+- [三、七大负载均衡策略与队列感知调度详解](#三七大负载均衡策略与队列感知调度详解)
 - [四、快速上手指南](#四快速上手指南)
   - [1. 列出集群模型](#1-列出集群模型)
   - [2. 模式一：生成启动命令 (`-mode cmd`)](#2-模式一生成启动命令--mode-cmd)
@@ -78,7 +78,7 @@ flowchart TD
 
             subgraph ModeProxy ["模式 B: mode=proxy (纯 Go 内置高性能网关)"]
                 GoProxy["纯 Go 反向代理引擎 (零外部环境依赖)"]
-                Balancers["6 大负载均衡算法池<br/>• 一致性哈希 (ConsistentHash)<br/>• 前缀缓存感知 (CacheAware)<br/>• 负载感知 P2C / 轮询 / 随机 / Rendezvous"]
+                Balancers["7 大负载均衡算法池<br/>• 最小排队优先 (LeastWaiting /metrics)<br/>• 一致性哈希 / 前缀缓存 (含 waiting 过载避让)<br/>• 负载感知 P2C / 轮询 / 随机 / Rendezvous"]
             end
         end
 
@@ -157,8 +157,9 @@ flowchart TD
    - 智能识别 `CUDA out of memory`、`NCCL error` 等致命故障，调用 GPUStack API 触发实例平滑重启。
    - 具备冷启动保护（Booting Guard）、防频跳重启冷却期与现场日志落盘审计（`logs/crashes`）。
 
-6. **支持官方全部 6 种负载均衡策略**
-   - 覆盖一致性哈希、Prefix-Caching 缓存感知、轮询、P2C、随机分发等算法，兼顾高并发吞吐与大模型 KV-Cache 上下文命中率。
+6. **支持 7 大负载均衡策略与后端 `/metrics` 真实队列感知**
+   - 覆盖最小排队优先 (`least_waiting`)、一致性哈希 (`consistent_hash`)、Prefix-Caching 缓存感知 (`cache_aware`)、P2C (`power_of_two`)、轮询、随机分发与最高随机权重哈希，兼顾极速均衡与大模型 KV-Cache 上下文命中率。
+   - **实例真实排队感知**：后台高频采集各实例 `<worker_url>/metrics`（如 `192.168.110.209:7000/metrics`）的 `vllm:num_requests_waiting` / `vllm:num_requests_running`（及 SGLang 等价指标），结合抓取间隙并发增量防止突发请求扎堆，彻底消除“单节点 `waiting=20`、其余节点空闲”的调度倾斜问题。
    - 多模型模式下，各个模型拥有**完全独立的负载均衡器**，互不干扰。
 
 7. **双重保障运行形态与手动/动态混合实例纳管**
@@ -172,7 +173,7 @@ flowchart TD
 
 ---
 
-## 三、六大负载均衡策略详解
+## 三、七大负载均衡策略与队列感知调度详解
 
 可以通过命令行随时查看受支持的策略：
 ```powershell
@@ -181,12 +182,27 @@ flowchart TD
 
 | 策略标识 (`-policy`) | 中文名称 | 会话亲和性 | 负载感知 | 适用业务场景与核心收益 |
 | :--- | :--- | :---: | :---: | :--- |
-| **`consistent_hash`**<br>*(推荐默认)* | **一致性哈希** | **是** | 否 | **多轮对话系统、智能客服、Agent 场景**。<br>根据会话标识将同一用户的连续交互精准路由到同一 Worker 节点，最大化复用 **KV Cache**，显著降低首字延迟（TTFT）。 |
-| **`cache_aware`** | **前缀缓存感知** | **是** (Cache) | **是** | **企业知识库（RAG）、公用长 Prompt 场景**。<br>根据 Prompt 共享前缀深度优化缓存重用，兼顾各 Worker 的负载倾斜度。 |
+| **`least_waiting`**<br>*(队列均衡推荐)* | **最小排队优先** | 否 | **是** (`/metrics`) | **并发压测、突发流量、防单点积压场景**。<br>实时采集各实例 `/metrics` 中的 `waiting` 与 `running` 请求数，优先将请求路由至 `waiting` 最少（其次 `running` 最少）的健康实例，彻底杜绝单节点排队阻塞而其他节点空闲的问题。 |
+| **`consistent_hash`**<br>*(默认)* | **一致性哈希** | **是** | **是** *(过载避让)* | **多轮对话系统、智能客服、Agent 场景**。<br>根据会话标识将连续交互路由到同一 Worker 节点以复用 **KV Cache**；当命中主节点的 `waiting >= waiting_threshold`（默认 `4`）且集群有更空闲节点时，自动溢出避让到最空闲节点。 |
+| **`cache_aware`** | **前缀缓存感知** | **是** (Cache) | **是** | **企业知识库（RAG）、公用长 Prompt 场景**。<br>根据 Prompt 共享前缀优化缓存重用；在 `proxy` 模式下同样支持 `waiting_threshold` 过载自动避让。 |
 | **`round_robin`** | **平滑轮询** | 否 | 否 | **单轮问答、基准评测、无状态请求**。<br>在各健康节点间严格均等交替分发流量。 |
-| **`power_of_two`**<br>*(P2C)* | **两选一负载均衡** | 否 | **是** | **请求耗时差异悬殊、长短文本混杂场景**。<br>每次随机抽取两个 Worker，优先分发给当前活跃在途连接数（Active Connections）较少的节点，避免单点过载。 |
+| **`power_of_two`**<br>*(P2C)* | **两选一负载均衡** | 否 | **是** | **请求耗时差异悬殊、长短文本混杂场景**。<br>每次随机抽取两个 Worker，优先分发给有效负载（`waiting`/`running`/活跃连接数）较低的节点，避免单点过载。 |
 | **`random`** | **均匀随机** | 否 | 否 | **超大节点集群、简单微服务部署**。<br>纯随机轮换，分发开销极低。 |
 | **`rendezvous_hash`** | **最高随机权重哈希** | **是** | 否 | **节点频繁动态增删集群**。<br>相比一致性哈希在节点下线时数据迁移更加平滑均匀。 |
+
+### 基于实例 `/metrics` 的排队感知与防扎堆机制
+在 `proxy` 模式下（或在 `run` 模式下使用 `least_waiting` 由 Go 直连代理自动接管），调度器会在后台并发抓取每个实例暴露的 Prometheus 指标（例如 `http://192.168.110.209:7000/metrics`）：
+1. **多引擎指标自动识别**：
+   - **vLLM**：`vllm:num_requests_waiting`、`vllm:num_requests_running`、`vllm:gpu_cache_usage_perc` / `vllm:kv_cache_usage_perc`（同时兼容 `_` 下划线命名及多引擎多标签累加）。
+   - **SGLang**：`sglang:num_queue_reqs`、`sglang:num_running_reqs`、`sglang:token_usage`。
+   - 当某后端未暴露 `/metrics` 或采集超时时，自动平滑回退至网关本地 `ActiveConns` 进行均衡，不影响正常服务。
+2. **抓取间隙防突发扎堆（Burst Anti-Herding）**：
+   - 每次抓取快照瞬间记录本地连接数 `ActiveAtScrape`，在两次抓取间隔（默认 `1s`）内，每个新在途请求按 `effectiveWaiting = scrapedWaiting + max(0, ActiveConns - ActiveAtScrape)` 实时累加，避免短时间海量突发请求全部涌向同一个空闲节点。
+   - 当多个空闲节点负载完全相同时（如 `waiting=0, running=0`），通过原子轮询游标均匀打散。
+3. **哈希过载避让保护 (`waiting_threshold`)**：
+   - 在 `consistent_hash` 与 `cache_aware` 策略下，默认 `waiting_threshold = 4`（设为 `0` 可关闭）。
+   - 仅当主节点排队数达到阈值 **且** 集群中存在 `waiting` 更低的健康节点时才触发溢出避让；若集群所有节点同等繁忙，则继续维持原哈希亲和性以保护 KV Cache 命中率。
+   - **注意**：该机制与 `least_waiting` 均由 Go 路由引擎执行；若需在 `consistent_hash` / `cache_aware` 下启用 `waiting_threshold` 避让，请将 `router.mode`（或对应模型的 `mode`）设为 `"proxy"`。
 
 ### 会话保持 Key 优先级（针对 `consistent_hash`）
 为了让多轮对话命中同一个实例，工具支持按以下优先级自动提取会话指纹：
@@ -262,11 +278,14 @@ docker run --rm -it --network host -p 8000:8000 vllm/vllm-router:latest --host 0
 无需在机器上编译或安装 Rust/Cargo，Go 程序自身直接作为兼容 OpenAI API 的反向代理网关，**原生支持全集群多模型自动聚合与按模型动态路由**。
 
 ```powershell
-# 启动内置代理网关（不传 -model，默认同步全集群所有模型）
-.\gpu-vllm-router.exe -mode proxy -port 8000 -policy consistent_hash
+# 启动内置代理网关（不传 -model，默认同步全集群所有模型，按实例 waiting 最少调度）
+.\gpu-vllm-router.exe -mode proxy -port 8000 -policy least_waiting
+
+# 或保留一致性哈希并在主节点 waiting >= 4 时自动避让到空闲实例：
+# .\gpu-vllm-router.exe -mode proxy -port 8000 -policy consistent_hash -waiting-threshold 4
 
 # 也可以锁定特定单模型：
-# .\gpu-vllm-router.exe -model DeepSeek-V4-Flash-0731-w8a8 -mode proxy -port 8000
+# .\gpu-vllm-router.exe -model DeepSeek-V4-Flash-0731-w8a8 -mode proxy -port 8000 -policy least_waiting
 ```
 
 #### 测试与验证调用：
@@ -274,23 +293,27 @@ docker run --rm -it --network host -p 8000:8000 vllm/vllm-router:latest --host 0
   ```bash
   curl http://localhost:8000/admin/stats
   ```
-  *返回集群全景视图：*
+  *返回集群全景视图（含采集自后端 `/metrics` 的实时 `running_requests` 与 `waiting_requests`）：*
   ```json
   {
-    "cluster_mode": true,
+    "mode": "multi_model_auto_sync",
+    "policy": "least_waiting",
     "model_count": 1,
     "models": {
       "DeepSeek-V4-Flash-0731-w8a8": {
         "backend_count": 1,
         "backends": [
           {
-            "url": "http://192.168.1.10:40039",
-            "active_conns": 0,
-            "healthy": true
+            "url": "http://192.168.110.209:7000",
+            "active_conns": 2,
+            "running_requests": 2,
+            "waiting_requests": 0,
+            "metrics_available": true,
+            "healthy": true,
+            "circuit_state": "CLOSED"
           }
         ],
-        "model": "DeepSeek-V4-Flash-0731-w8a8",
-        "policy": "consistent_hash"
+        "model_name": "DeepSeek-V4-Flash-0731-w8a8"
       }
     }
   }
@@ -616,6 +639,9 @@ scrape_configs:
 | **`vllm_router_cb_state`** | Gauge | `worker="http://..."` | **各 Worker 当前熔断器健康状态**。<br>取值：`0 = CLOSED (健康)`, `1 = HALF_OPEN (探测中)`, `2 = OPEN (熔断隔离)`。 |
 | **`vllm_router_active_workers`** | Gauge | `model="..."` | **各模型当前激活配置的 Worker 实例总数**。 |
 | **`vllm_router_healthy_workers`** | Gauge | `model="..."` | **各模型当前经就绪探测确认健康的 Worker 实例数量**。 |
+| **`gpu_router_worker_waiting_requests`** | Gauge | `model="..."`, `worker="http://..."` | **采集自各后端推理实例 `/metrics` 的实时等待队列长度 (`waiting`)**。 |
+| **`gpu_router_worker_running_requests`** | Gauge | `model="..."`, `worker="http://..."` | **采集自各后端推理实例 `/metrics` 的实时推理执行请求数 (`running`)**。 |
+| **`gpu_router_worker_kv_cache_usage`** | Gauge | `model="..."`, `worker="http://..."` | **采集自各后端推理实例 `/metrics` 的 KV Cache 使用率 (`0.0 ~ 1.0`)**。 |
 
 ### 3. 常用 PromQL 监控与告警表达式
 
@@ -676,7 +702,11 @@ scrape_configs:
 | `-model` | - | *(空)* | **选填**。留空自动开启【全集群多模型自动纳管】；指定名称锁定单模型 |
 | `-worker-urls` | - | *(空)* | **手动指定的后端 Worker 实例 URL 列表** (逗号分隔，支持脱离 GPUStack 独立运行或与 GPUStack 混合合并) |
 | `-mode` | - | `cmd` | 运行模式：`cmd` (输出启动命令), `proxy` (内置多模型网关), `run` (守护官方路由器) |
-| `-policy` | - | `consistent_hash` | 负载策略：`consistent_hash`, `cache_aware`, `round_robin`, `power_of_two`, `random`, `rendezvous_hash` |
+| `-policy` | - | `consistent_hash` | 负载策略：`least_waiting`, `consistent_hash`, `cache_aware`, `round_robin`, `power_of_two`, `random`, `rendezvous_hash` |
+| `-waiting-threshold` | - | `-1` (默认 `4`) | `proxy` 模式下 `consistent_hash` / `cache_aware` 的 `waiting` 过载避让阈值（`-1` 继承配置或默认 `4`，`0` 禁用） |
+| `-metrics-scrape-interval` | - | `1s` | 后端实例 `/metrics` 队列指标轮询采集间隔 |
+| `-metrics-scrape-timeout` | - | `1500ms` | 后端实例 `/metrics` 单次采集超时时间 |
+| `-worker-metrics-path` | - | `/metrics` | 后端实例暴露 Prometheus 指标的 HTTP 路径 |
 | `-gpustack-url` | `GPUSTACK_BASE_URL` | `http://127.0.0.1:8200` | GPUStack API 服务地址 (设为 `off` 或 `none` 可启用纯手动独立运行模式) |
 | `-username` | `GPUSTACK_USERNAME` | `admin` | GPUStack 登录管理员用户名 |
 | `-password` | `GPUSTACK_PASSWORD` | *(空)* | GPUStack 登录密码 |
@@ -725,12 +755,12 @@ gpustack:
 
 target:
   model_name: ""               # 留空代表全集群多模型自动聚合
-  policy: "consistent_hash"    # 默认负载调度策略
+  policy: "least_waiting"      # 推荐 least_waiting (最小排队) 或 consistent_hash (含过载避让)
   # worker_urls:               # 可选：手动添加的全局/单模型静态 Worker 实例地址
   #   - "http://192.168.1.50:8000"
 
 router:
-  mode: "proxy"               # cmd | proxy | run
+  mode: "proxy"               # cmd | proxy | run (队列感知/过载避让推荐 proxy)
   host: "0.0.0.0"
   port: 8000                  # 业务网关主端口
   metrics_port: 29000         # Prometheus 监控指标独立端口
@@ -741,6 +771,10 @@ router:
   log_file: "/app/logs/router.log"
   zero_downtime: true
   drain_timeout: 60s
+  waiting_threshold: 4        # consistent_hash/cache_aware 过载避让阈值 (0=禁用)
+  metrics_scrape_interval: 1s # 后端实例 /metrics 采集间隔
+  metrics_scrape_timeout: 1500ms
+  worker_metrics_path: "/metrics"
 
 circuit_breaker:
   enabled: true               # 是否开启断路器与透明重试
@@ -826,6 +860,10 @@ WantedBy=multi-user.target
 ### 2. 多轮对话与 KV-Cache 复用调优
 - 强烈建议业务客户端在请求时带上 HTTP 请求头 `X-Session-ID: <session_uuid>`。
 - 在 `consistent_hash` 策略下，拥有相同 `X-Session-ID` 的请求将始终落入同一张显卡/节点，使大模型上下文命中率提升 70%~95% 以上，推理首字延迟大幅降低。
+
+### 3. 防单节点排队积压与队列感知调优
+- **彻底按排队均衡（推荐高并发 / 压测场景）**：将 `router.mode` 设为 `"proxy"`、`target.policy` 设为 `"least_waiting"`，网关每秒采集各节点 `<worker_url>/metrics` 的 `waiting`/`running`，自动避开排队积压节点（如 `running=12, waiting=20`）优先分发到 `waiting=0` 的空闲节点。
+- **兼顾缓存亲和性与均衡**：将 `router.mode` 设为 `"proxy"`、`target.policy` 设为 `"consistent_hash"` 或 `"cache_aware"`，配合 `waiting_threshold: 4`（或根据单机并发容量调至 `2~8`），在低排队时保持 KV Cache 亲和性，在热点节点出现排队积压时自动将溢出流量调度至空闲实例。
 
 ---
 

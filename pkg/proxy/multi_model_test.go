@@ -4,13 +4,16 @@ import (
 	"bytes"
 	"context"
 	"encoding/json"
+	"fmt"
 	"net/http"
 	"net/http/httptest"
 	"net/url"
 	"os"
 	"path/filepath"
 	"strings"
+	"sync/atomic"
 	"testing"
+	"time"
 
 	"gpu-vllm-router/pkg/config"
 	"gpu-vllm-router/pkg/dashboard"
@@ -537,6 +540,74 @@ func TestProxy_ManualAndHybridWorkers(t *testing.T) {
 	srv.reverseProxy.ServeHTTP(rec2, req2)
 	if rec2.Code != http.StatusOK || !strings.Contains(rec2.Body.String(), "proxy_manual_2") {
 		t.Fatalf("expected 200 proxy_manual_2, got status=%d body=%s", rec2.Code, rec2.Body.String())
+	}
+}
+
+func TestProxyLeastWaitingEndToEnd(t *testing.T) {
+	var hits [4]int64
+	makeBackend := func(idx int, running, waiting int) *httptest.Server {
+		return httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			if r.URL.Path == "/metrics" {
+				fmt.Fprintf(w, "vllm:num_requests_running %d\nvllm:num_requests_waiting %d\n", running, waiting)
+				return
+			}
+			atomic.AddInt64(&hits[idx], 1)
+			w.Header().Set("Content-Type", "application/json")
+			w.WriteHeader(http.StatusOK)
+			fmt.Fprintf(w, `{"worker":%d}`, idx)
+		}))
+	}
+
+	b0 := makeBackend(0, 12, 20) // Heavily overloaded
+	defer b0.Close()
+	b1 := makeBackend(1, 0, 0) // Idle
+	defer b1.Close()
+	b2 := makeBackend(2, 0, 0) // Idle
+	defer b2.Close()
+	b3 := makeBackend(3, 0, 0) // Idle
+	defer b3.Close()
+
+	srv := NewServer(ServerConfig{
+		Policy:                router.PolicyLeastWaiting,
+		ModelName:             "deepseek-v4",
+		StaticWorkerURLs:      []string{b0.URL, b1.URL, b2.URL, b3.URL},
+		MetricsScrapeInterval: 100 * time.Millisecond,
+		ConfigFilePath:        filepath.Join(t.TempDir(), "config.yaml"),
+	}, nil)
+
+	eps := srv.mergeSingleModelWithManual("deepseek-v4", nil)
+	srv.updateSingleModelEndpoints("deepseek-v4", eps)
+	srv.metricsStore.ScrapeOnce(context.Background())
+
+	for i := 0; i < 6; i++ {
+		req := httptest.NewRequest(http.MethodPost, "http://localhost:8000/v1/chat/completions", strings.NewReader(`{"model":"deepseek-v4"}`))
+		rec := httptest.NewRecorder()
+		srv.reverseProxy.ServeHTTP(rec, req)
+		if rec.Code != http.StatusOK {
+			t.Fatalf("request %d failed: status=%d body=%s", i, rec.Code, rec.Body.String())
+		}
+	}
+
+	if atomic.LoadInt64(&hits[0]) != 0 {
+		t.Errorf("expected 0 requests sent to overloaded worker b0 (waiting=20), got %d", atomic.LoadInt64(&hits[0]))
+	}
+	if atomic.LoadInt64(&hits[1])+atomic.LoadInt64(&hits[2])+atomic.LoadInt64(&hits[3]) != 6 {
+		t.Errorf("expected all 6 requests distributed across idle workers, got hits=%v", []int64{hits[1], hits[2], hits[3]})
+	}
+
+	// Verify /api/topology exposes scraped waiting/running metrics
+	topo, err := srv.GetTopology(context.Background())
+	if err != nil {
+		t.Fatalf("GetTopology failed: %v", err)
+	}
+	var foundOverloaded bool
+	for _, w := range topo.Models[0].Workers {
+		if w.URL == b0.URL && w.WaitingRequests == 20 && w.RunningRequests == 12 && w.MetricsAvailable {
+			foundOverloaded = true
+		}
+	}
+	if !foundOverloaded {
+		t.Errorf("expected topology to reflect waiting=20 running=12 on b0, got %+v", topo.Models[0].Workers)
 	}
 }
 

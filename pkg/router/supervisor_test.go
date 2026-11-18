@@ -3,6 +3,7 @@ package router
 import (
 	"bytes"
 	"context"
+	"fmt"
 	"io"
 	"net/http"
 	"net/http/httptest"
@@ -691,6 +692,90 @@ func TestSupervisor_PureManualAndRuntimeAddWorkers(t *testing.T) {
 	sup.handleProxy(rw, req)
 	if rw.Code != http.StatusOK || !strings.Contains(rw.Body.String(), "from_manual_worker_2") {
 		t.Fatalf("expected 200 from_manual_worker_2, got status=%d body=%s", rw.Code, rw.Body.String())
+	}
+}
+
+func TestSupervisorLeastWaitingAutoProxyAndMetrics(t *testing.T) {
+	var hits [2]int64
+	busyWorker := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch r.URL.Path {
+		case "/v1/models":
+			_, _ = w.Write([]byte(`{"data":[{"id":"qwen"}]}`))
+		case "/metrics":
+			_, _ = w.Write([]byte("vllm:num_requests_running 12\nvllm:num_requests_waiting 20\n"))
+		default:
+			atomic.AddInt64(&hits[0], 1)
+			_, _ = w.Write([]byte(`{"worker":"busy"}`))
+		}
+	}))
+	defer busyWorker.Close()
+
+	idleWorker := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch r.URL.Path {
+		case "/v1/models":
+			_, _ = w.Write([]byte(`{"data":[{"id":"qwen"}]}`))
+		case "/metrics":
+			_, _ = w.Write([]byte("vllm:num_requests_running 0\nvllm:num_requests_waiting 0\n"))
+		default:
+			atomic.AddInt64(&hits[1], 1)
+			_, _ = w.Write([]byte(`{"worker":"idle"}`))
+		}
+	}))
+	defer idleWorker.Close()
+
+	pubPort, err := getFreePort()
+	if err != nil {
+		t.Fatalf("getFreePort failed: %v", err)
+	}
+
+	sup := NewSupervisor(nil, "qwen", SupervisorConfig{
+		PublicHost:            "127.0.0.1",
+		PublicPort:            pubPort,
+		MetricsPort:           -1,
+		MetricsScrapeInterval: 100 * time.Millisecond,
+		ConfigFilePath:        filepath.Join(t.TempDir(), "config.yaml"),
+		RouterCfg: Config{
+			Policy:     PolicyLeastWaiting,
+			WorkerURLs: []string{busyWorker.URL, idleWorker.URL},
+		},
+	})
+
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	if err := sup.Start(ctx); err != nil {
+		t.Fatalf("Supervisor.Start failed: %v", err)
+	}
+	defer sup.Stop()
+
+	sup.mu.RLock()
+	runner := sup.runners["qwen"]
+	sup.mu.RUnlock()
+	if runner == nil || runner.Mode != "proxy" {
+		t.Fatalf("expected least_waiting to automatically use proxy mode, got runner=%+v", runner)
+	}
+
+	sup.metricsStore.ScrapeOnce(ctx)
+
+	for i := 0; i < 4; i++ {
+		req := httptest.NewRequest(http.MethodPost, "/v1/chat/completions", strings.NewReader(`{"model":"qwen"}`))
+		rw := httptest.NewRecorder()
+		sup.handleProxy(rw, req)
+		if rw.Code != http.StatusOK || !strings.Contains(rw.Body.String(), "idle") {
+			t.Fatalf("expected request %d routed to idle worker, got status=%d body=%s", i, rw.Code, rw.Body.String())
+		}
+	}
+	if atomic.LoadInt64(&hits[0]) != 0 || atomic.LoadInt64(&hits[1]) != 4 {
+		t.Errorf("expected busy=0 idle=4, got busy=%d idle=%d", hits[0], hits[1])
+	}
+	if ac := atomic.LoadInt64(&runner.activeConns); ac != 0 {
+		t.Errorf("expected runner.activeConns to return to 0, got %d", ac)
+	}
+
+	// Verify Supervisor /metrics exports scraped waiting metric
+	rwMetrics := httptest.NewRecorder()
+	sup.handleMetrics(rwMetrics, httptest.NewRequest(http.MethodGet, "/metrics", nil))
+	if !strings.Contains(rwMetrics.Body.String(), fmt.Sprintf("gpu_router_worker_waiting_requests{model=%q,worker=%q} 20", "qwen", busyWorker.URL)) {
+		t.Errorf("expected gpu_router_worker_waiting_requests in /metrics, got:\n%s", rwMetrics.Body.String())
 	}
 }
 

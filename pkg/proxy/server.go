@@ -26,31 +26,36 @@ import (
 	"gpu-vllm-router/pkg/logger"
 	"gpu-vllm-router/pkg/router"
 	"gpu-vllm-router/pkg/swagger"
+	"gpu-vllm-router/pkg/workermetrics"
 )
 
 // ServerConfig configures the native Go reverse proxy server.
 type ServerConfig struct {
-	Host                string
-	Port                int
-	MetricsPort         int
-	Policy              router.Policy
-	ModelName           string   // If empty, operates in full-cluster multi-model mode
-	StaticWorkerURLs    []string // Optional manual static worker URLs (from target.worker_urls or --worker-urls)
-	WatchInterval       time.Duration
-	CircuitBreaker      CircuitBreakerConfig
-	ConfigFilePath      string
-	ModelRules          []config.ModelRule
-	ZeroDowntime        bool
-	DrainTimeout        time.Duration
-	BalanceAbsThreshold *int
-	BalanceRelThreshold *float64
-	CacheThreshold      *float64
-	ExtraArgs           []string
-	RouterBin           string
-	Backend             string
-	LogLevel            string
-	LogDir              string
-	AutoHeal            config.AutoHealConfig
+	Host                  string
+	Port                  int
+	MetricsPort           int
+	Policy                router.Policy
+	ModelName             string   // If empty, operates in full-cluster multi-model mode
+	StaticWorkerURLs      []string // Optional manual static worker URLs (from target.worker_urls or --worker-urls)
+	WatchInterval         time.Duration
+	CircuitBreaker        CircuitBreakerConfig
+	ConfigFilePath        string
+	ModelRules            []config.ModelRule
+	ZeroDowntime          bool
+	DrainTimeout          time.Duration
+	BalanceAbsThreshold   *int
+	BalanceRelThreshold   *float64
+	CacheThreshold        *float64
+	WaitingThreshold      *int
+	MetricsScrapeInterval time.Duration
+	MetricsScrapeTimeout  time.Duration
+	WorkerMetricsPath     string
+	ExtraArgs             []string
+	RouterBin             string
+	Backend               string
+	LogLevel              string
+	LogDir                string
+	AutoHeal              config.AutoHealConfig
 }
 
 // ModelPool manages load balancing and active targets for a specific model.
@@ -66,6 +71,7 @@ type ModelPool struct {
 	BalanceAbsThreshold *int
 	BalanceRelThreshold *float64
 	CacheThreshold      *float64
+	WaitingThreshold    *int
 	ExtraArgs           []string
 }
 
@@ -213,6 +219,7 @@ type Server struct {
 	endpointsMu   sync.RWMutex
 	endpointsMeta map[string]gpustack.WorkerEndpoint
 	autoHealer    *gpustack.AutoHealer
+	metricsStore  *workermetrics.Store
 }
 
 // NewServer creates a new reverse proxy Server.
@@ -229,6 +236,15 @@ func NewServer(cfg ServerConfig, client *gpustack.Client) *Server {
 	if cfg.WatchInterval <= 0 {
 		cfg.WatchInterval = 10 * time.Second
 	}
+	if cfg.MetricsScrapeInterval <= 0 {
+		cfg.MetricsScrapeInterval = 1 * time.Second
+	}
+	if cfg.MetricsScrapeTimeout <= 0 {
+		cfg.MetricsScrapeTimeout = 1500 * time.Millisecond
+	}
+	if cfg.WorkerMetricsPath == "" {
+		cfg.WorkerMetricsPath = "/metrics"
+	}
 	if cfg.CircuitBreaker.MaxFailures <= 0 {
 		cfg.CircuitBreaker = DefaultCircuitBreakerConfig()
 	}
@@ -240,6 +256,12 @@ func NewServer(cfg ServerConfig, client *gpustack.Client) *Server {
 	}
 	cfg.StaticWorkerURLs = config.NormalizeWorkerURLs(cfg.StaticWorkerURLs)
 
+	metricsStore := workermetrics.NewStore(workermetrics.Config{
+		ScrapeInterval: cfg.MetricsScrapeInterval,
+		ScrapeTimeout:  cfg.MetricsScrapeTimeout,
+		MetricsPath:    cfg.WorkerMetricsPath,
+	})
+
 	s := &Server{
 		cfg:            cfg,
 		client:         client,
@@ -249,7 +271,18 @@ func NewServer(cfg ServerConfig, client *gpustack.Client) *Server {
 		modelRules:     rulesMap,
 		endpointsMeta:  make(map[string]gpustack.WorkerEndpoint),
 		autoHealer:     gpustack.NewAutoHealer(client, cfg.AutoHeal),
+		metricsStore:   metricsStore,
 	}
+
+	metricsStore.SetOnScrape(func(workerURL string, _ workermetrics.WorkerMetrics) {
+		s.mu.RLock()
+		for _, t := range s.allTargets {
+			if strings.TrimRight(t.URLString, "/") == workerURL {
+				t.SnapshotActiveAtScrape()
+			}
+		}
+		s.mu.RUnlock()
+	})
 
 	// Custom ReverseProxy with RetryTransport
 	proxy := &httputil.ReverseProxy{
@@ -727,6 +760,11 @@ func (s *Server) Start(ctx context.Context) error {
 	// Start background circuit breaker active health probe loop
 	go s.probeLoop(ctx)
 
+	// Start background worker /metrics scraper loop for queue/waiting-aware load balancing
+	if s.metricsStore != nil {
+		go s.metricsStore.Run(ctx, s.stopCh)
+	}
+
 	log.Printf("[Proxy] Native Multi-Model Load Balancer running on http://%s (Policy: %s, MaxRetries: %d)",
 		addr, s.cfg.Policy, s.cfg.CircuitBreaker.MaxRetries)
 	log.Printf("[Proxy] Swagger UI documentation: http://%s/docs (OpenAPI spec: /openapi.json)", addr)
@@ -926,6 +964,16 @@ func (s *Server) findExistingTarget(urlStr string) *BackendTarget {
 	return nil
 }
 
+func (s *Server) resolveWaitingThresholdLocked(modelName string) int {
+	if rule, ok := s.modelRules[modelName]; ok && rule.WaitingThreshold != nil {
+		return *rule.WaitingThreshold
+	}
+	if s.cfg.WaitingThreshold != nil {
+		return *s.cfg.WaitingThreshold
+	}
+	return DefaultWaitingThreshold
+}
+
 func (s *Server) updateSingleModelEndpoints(modelName string, endpoints []gpustack.WorkerEndpoint) {
 	s.recordEndpointsMeta(endpoints)
 
@@ -954,6 +1002,7 @@ func (s *Server) updateSingleModelEndpoints(modelName string, endpoints []gpusta
 			URLString:      ep.URL,
 			Healthy:        true,
 			CircuitBreaker: cb,
+			MetricsStore:   s.metricsStore,
 		})
 		urls = append(urls, ep.URL)
 		log.Printf("  -> Model: %-25s Backend: %s (Worker: %s)", ep.ModelName, ep.URL, ep.WorkerName)
@@ -963,9 +1012,13 @@ func (s *Server) updateSingleModelEndpoints(modelName string, endpoints []gpusta
 	s.pruneEndpointsMeta(urls)
 	s.allTargets = targets
 	s.activeURLs = urls
+	if s.metricsStore != nil {
+		s.metricsStore.SetWorkerURLs(urls)
+	}
 
 	poolMode := "proxy"
 	poolPolicy := s.cfg.Policy
+	var waitThreshPtr *int
 	if rule, ok := s.modelRules[modelName]; ok {
 		if rule.Mode != "" {
 			poolMode = rule.Mode
@@ -975,14 +1028,17 @@ func (s *Server) updateSingleModelEndpoints(modelName string, endpoints []gpusta
 				poolPolicy = parsedP
 			}
 		}
+		waitThreshPtr = rule.WaitingThreshold
 	}
+	waitThresh := s.resolveWaitingThresholdLocked(modelName)
 
 	pool := &ModelPool{
-		ModelName: modelName,
-		Mode:      poolMode,
-		Policy:    poolPolicy,
-		Balancer:  NewBalancer(poolPolicy, targets),
-		Targets:   targets,
+		ModelName:        modelName,
+		Mode:             poolMode,
+		Policy:           poolPolicy,
+		Balancer:         NewBalancerWithWaitingThreshold(poolPolicy, targets, waitThresh),
+		Targets:          targets,
+		WaitingThreshold: waitThreshPtr,
 	}
 	s.modelPools[modelName] = pool
 }
@@ -1021,6 +1077,7 @@ func (s *Server) updateClusterEndpoints(cluster *gpustack.ClusterEndpoints) {
 				URLString:      ep.URL,
 				Healthy:        true,
 				CircuitBreaker: cb,
+				MetricsStore:   s.metricsStore,
 			}
 			targets = append(targets, t)
 			allTargets = append(allTargets, t)
@@ -1030,6 +1087,7 @@ func (s *Server) updateClusterEndpoints(cluster *gpustack.ClusterEndpoints) {
 
 		poolMode := "proxy"
 		poolPolicy := s.cfg.Policy
+		var waitThreshPtr *int
 		if rule, ok := s.modelRules[mName]; ok {
 			if rule.Mode != "" {
 				poolMode = rule.Mode
@@ -1039,14 +1097,17 @@ func (s *Server) updateClusterEndpoints(cluster *gpustack.ClusterEndpoints) {
 					poolPolicy = parsedP
 				}
 			}
+			waitThreshPtr = rule.WaitingThreshold
 		}
+		waitThresh := s.resolveWaitingThresholdLocked(mName)
 
 		pool := &ModelPool{
-			ModelName: mName,
-			Mode:      poolMode,
-			Policy:    poolPolicy,
-			Balancer:  NewBalancer(poolPolicy, targets),
-			Targets:   targets,
+			ModelName:        mName,
+			Mode:             poolMode,
+			Policy:           poolPolicy,
+			Balancer:         NewBalancerWithWaitingThreshold(poolPolicy, targets, waitThresh),
+			Targets:          targets,
+			WaitingThreshold: waitThreshPtr,
 		}
 
 		// Preserve runner if previous pool had one
@@ -1071,6 +1132,9 @@ func (s *Server) updateClusterEndpoints(cluster *gpustack.ClusterEndpoints) {
 	s.allTargets = allTargets
 	s.activeURLs = allURLs
 	s.modelsList = modelsList
+	if s.metricsStore != nil {
+		s.metricsStore.SetWorkerURLs(allURLs)
+	}
 }
 
 func (s *Server) probeLoop(ctx context.Context) {
@@ -1279,6 +1343,10 @@ func (s *Server) handleStats(w http.ResponseWriter, r *http.Request) {
 	type targetStat struct {
 		URL                 string       `json:"url"`
 		ActiveConns         int64        `json:"active_conns"`
+		RunningRequests     float64      `json:"running_requests"`
+		WaitingRequests     float64      `json:"waiting_requests"`
+		KVCacheUsage        float64      `json:"kv_cache_usage,omitempty"`
+		MetricsAvailable    bool         `json:"metrics_available"`
 		Healthy             bool         `json:"healthy"`
 		CircuitState        CircuitState `json:"circuit_state"`
 		ConsecutiveFailures int          `json:"consecutive_failures"`
@@ -1301,9 +1369,23 @@ func (s *Server) handleStats(w http.ResponseWriter, r *http.Request) {
 				state, fails, _ = t.CircuitBreaker.GetStatus()
 				healthy = t.CircuitBreaker.CanExecute()
 			}
+			var runReq, waitReq, kvUsage float64
+			var metricsOK bool
+			if s.metricsStore != nil {
+				if m, ok := s.metricsStore.Get(t.URLString); ok {
+					runReq = m.Running
+					waitReq = m.Waiting
+					kvUsage = m.KVCacheUsage
+					metricsOK = true
+				}
+			}
 			bStats = append(bStats, targetStat{
 				URL:                 t.URLString,
 				ActiveConns:         atomic.LoadInt64(&t.ActiveConns),
+				RunningRequests:     runReq,
+				WaitingRequests:     waitReq,
+				KVCacheUsage:        kvUsage,
+				MetricsAvailable:    metricsOK,
 				Healthy:             healthy,
 				CircuitState:        state,
 				ConsecutiveFailures: fails,
@@ -1420,6 +1502,38 @@ func (s *Server) handleMetrics(w http.ResponseWriter, r *http.Request) {
 		}
 	}
 
+	if s.metricsStore != nil {
+		buf.WriteString("\n# HELP gpu_router_worker_waiting_requests Scraped waiting requests in worker inference queue\n")
+		buf.WriteString("# TYPE gpu_router_worker_waiting_requests gauge\n")
+		for mName, pool := range pools {
+			for _, t := range pool.Targets {
+				if m, ok := s.metricsStore.Get(t.URLString); ok {
+					fmt.Fprintf(&buf, "gpu_router_worker_waiting_requests{model=%q,worker=%q} %g\n", mName, t.URLString, m.Waiting)
+				}
+			}
+		}
+
+		buf.WriteString("\n# HELP gpu_router_worker_running_requests Scraped running requests on worker inference engine\n")
+		buf.WriteString("# TYPE gpu_router_worker_running_requests gauge\n")
+		for mName, pool := range pools {
+			for _, t := range pool.Targets {
+				if m, ok := s.metricsStore.Get(t.URLString); ok {
+					fmt.Fprintf(&buf, "gpu_router_worker_running_requests{model=%q,worker=%q} %g\n", mName, t.URLString, m.Running)
+				}
+			}
+		}
+
+		buf.WriteString("\n# HELP gpu_router_worker_kv_cache_usage Scraped KV cache usage ratio (0..1) on worker\n")
+		buf.WriteString("# TYPE gpu_router_worker_kv_cache_usage gauge\n")
+		for mName, pool := range pools {
+			for _, t := range pool.Targets {
+				if m, ok := s.metricsStore.Get(t.URLString); ok {
+					fmt.Fprintf(&buf, "gpu_router_worker_kv_cache_usage{model=%q,worker=%q} %g\n", mName, t.URLString, m.KVCacheUsage)
+				}
+			}
+		}
+	}
+
 	w.Header().Set("Content-Type", "text/plain; version=0.0.4; charset=utf-8")
 	w.WriteHeader(http.StatusOK)
 	_, _ = w.Write(buf.Bytes())
@@ -1464,9 +1578,24 @@ func (s *Server) GetTopology(ctx context.Context) (*dashboard.TopologyData, erro
 				modelHealthy++
 			}
 
+			var runReq, waitReq, kvUsage float64
+			var metricsOK bool
+			if s.metricsStore != nil {
+				if m, ok := s.metricsStore.Get(t.URLString); ok {
+					runReq = m.Running
+					waitReq = m.Waiting
+					kvUsage = m.KVCacheUsage
+					metricsOK = true
+				}
+			}
+
 			workersTopo = append(workersTopo, dashboard.WorkerTopology{
 				URL:                 t.URLString,
 				ActiveConns:         conns,
+				RunningRequests:     runReq,
+				WaitingRequests:     waitReq,
+				KVCacheUsage:        kvUsage,
+				MetricsAvailable:    metricsOK,
 				Healthy:             healthy,
 				CircuitState:        string(state),
 				ConsecutiveFailures: fails,
@@ -1589,9 +1718,11 @@ func (s *Server) UpdateConfig(ctx context.Context, req dashboard.ConfigUpdateReq
 			return nil, fmt.Errorf("invalid policy: %w", err)
 		}
 		s.cfg.Policy = p
-		for _, pool := range s.modelPools {
-			if pool.Policy == "" {
-				pool.Balancer = NewBalancer(p, pool.Targets)
+		for mName, pool := range s.modelPools {
+			rule, hasRule := s.modelRules[mName]
+			if !hasRule || rule.Policy == "" {
+				pool.Policy = p
+				pool.Balancer = NewBalancerWithWaitingThreshold(p, pool.Targets, s.resolveWaitingThresholdLocked(mName))
 			}
 		}
 	}
@@ -1631,6 +1762,19 @@ func (s *Server) UpdateConfig(ctx context.Context, req dashboard.ConfigUpdateReq
 	if req.CacheThreshold != nil {
 		s.cfg.CacheThreshold = req.CacheThreshold
 	}
+	if req.WaitingThreshold != nil {
+		s.cfg.WaitingThreshold = req.WaitingThreshold
+		for mName, pool := range s.modelPools {
+			if ch, ok := pool.Balancer.(*ConsistentHashBalancer); ok {
+				ch.SetWaitingThreshold(s.resolveWaitingThresholdLocked(mName))
+			} else if ca, ok := pool.Balancer.(*CacheAwareBalancer); ok {
+				ca.SetWaitingThreshold(s.resolveWaitingThresholdLocked(mName))
+			}
+		}
+	}
+	if req.MetricsScrapeIntervalSecs != nil && *req.MetricsScrapeIntervalSecs > 0 {
+		s.cfg.MetricsScrapeInterval = time.Duration(*req.MetricsScrapeIntervalSecs) * time.Second
+	}
 	if req.ExtraArgs != nil {
 		s.cfg.ExtraArgs = req.ExtraArgs
 	}
@@ -1651,6 +1795,7 @@ func (s *Server) UpdateConfig(ctx context.Context, req dashboard.ConfigUpdateReq
 				BalanceAbsThreshold: m.BalanceAbsThreshold,
 				BalanceRelThreshold: m.BalanceRelThreshold,
 				CacheThreshold:      m.CacheThreshold,
+				WaitingThreshold:    m.WaitingThreshold,
 				ExtraArgs:           m.ExtraArgs,
 			}
 			s.modelRules[m.ModelName] = rule
@@ -1682,6 +1827,7 @@ func (s *Server) UpdateModelRule(ctx context.Context, req dashboard.ModelRuleUpd
 		BalanceAbsThreshold: req.BalanceAbsThreshold,
 		BalanceRelThreshold: req.BalanceRelThreshold,
 		CacheThreshold:      req.CacheThreshold,
+		WaitingThreshold:    req.WaitingThreshold,
 		ExtraArgs:           req.ExtraArgs,
 	}
 	s.modelRules[req.ModelName] = rule
@@ -1720,12 +1866,16 @@ func (s *Server) applyModelRuleLocked(ctx context.Context, rule config.ModelRule
 				URLString:      ep.URL,
 				Healthy:        true,
 				CircuitBreaker: cb,
+				MetricsStore:   s.metricsStore,
 			}
 			targets = append(targets, t)
 			s.allTargets = append(s.allTargets, t)
 			s.activeURLs = append(s.activeURLs, ep.URL)
 		}
 		sort.Strings(s.activeURLs)
+		if s.metricsStore != nil {
+			s.metricsStore.SetWorkerURLs(s.activeURLs)
+		}
 
 		targetMode := rule.Mode
 		if targetMode == "" {
@@ -1742,11 +1892,12 @@ func (s *Server) applyModelRuleLocked(ctx context.Context, rule config.ModelRule
 			ModelName:           rule.ModelName,
 			Mode:                targetMode,
 			Policy:              targetPolicy,
-			Balancer:            NewBalancer(targetPolicy, targets),
+			Balancer:            NewBalancerWithWaitingThreshold(targetPolicy, targets, s.resolveWaitingThresholdLocked(rule.ModelName)),
 			Targets:             targets,
 			BalanceAbsThreshold: rule.BalanceAbsThreshold,
 			BalanceRelThreshold: rule.BalanceRelThreshold,
 			CacheThreshold:      rule.CacheThreshold,
+			WaitingThreshold:    rule.WaitingThreshold,
 			ExtraArgs:           rule.ExtraArgs,
 		}
 		s.modelPools[rule.ModelName] = pool
@@ -1794,6 +1945,7 @@ func (s *Server) applyModelRuleLocked(ctx context.Context, rule config.ModelRule
 				URLString:      ep.URL,
 				Healthy:        true,
 				CircuitBreaker: cb,
+				MetricsStore:   s.metricsStore,
 			}
 			newTargets = append(newTargets, t)
 			if existing == nil {
@@ -1802,6 +1954,9 @@ func (s *Server) applyModelRuleLocked(ctx context.Context, rule config.ModelRule
 			}
 		}
 		sort.Strings(s.activeURLs)
+		if s.metricsStore != nil {
+			s.metricsStore.SetWorkerURLs(s.activeURLs)
+		}
 		pool.Targets = newTargets
 	}
 
@@ -1812,19 +1967,21 @@ func (s *Server) applyModelRuleLocked(ctx context.Context, rule config.ModelRule
 	prevMode := pool.Mode
 	pool.Mode = targetMode
 
+	waitThresh := s.resolveWaitingThresholdLocked(rule.ModelName)
 	if rule.Policy != "" {
 		if p, err := router.ParsePolicy(rule.Policy); err == nil {
 			pool.Policy = p
-			pool.Balancer = NewBalancer(p, pool.Targets)
+			pool.Balancer = NewBalancerWithWaitingThreshold(p, pool.Targets, waitThresh)
 		}
 	} else {
 		pool.Policy = s.cfg.Policy
-		pool.Balancer = NewBalancer(s.cfg.Policy, pool.Targets)
+		pool.Balancer = NewBalancerWithWaitingThreshold(s.cfg.Policy, pool.Targets, waitThresh)
 	}
 
 	pool.BalanceAbsThreshold = rule.BalanceAbsThreshold
 	pool.BalanceRelThreshold = rule.BalanceRelThreshold
 	pool.CacheThreshold = rule.CacheThreshold
+	pool.WaitingThreshold = rule.WaitingThreshold
 	pool.ExtraArgs = rule.ExtraArgs
 
 	// Mode run: spawn runner if needed
@@ -1976,16 +2133,20 @@ func (s *Server) saveConfigToFileLocked() error {
 
 	cfgToSave := &config.FileConfig{
 		Router: config.RouterConfig{
-			Mode:                "proxy",
-			Host:                s.cfg.Host,
-			Port:                s.cfg.Port,
-			WatchInterval:       s.cfg.WatchInterval,
-			ZeroDowntime:        &s.cfg.ZeroDowntime,
-			DrainTimeout:        s.cfg.DrainTimeout,
-			BalanceAbsThreshold: s.cfg.BalanceAbsThreshold,
-			BalanceRelThreshold: s.cfg.BalanceRelThreshold,
-			CacheThreshold:      s.cfg.CacheThreshold,
-			ExtraArgs:           s.cfg.ExtraArgs,
+			Mode:                  "proxy",
+			Host:                  s.cfg.Host,
+			Port:                  s.cfg.Port,
+			WatchInterval:         s.cfg.WatchInterval,
+			ZeroDowntime:          &s.cfg.ZeroDowntime,
+			DrainTimeout:          s.cfg.DrainTimeout,
+			BalanceAbsThreshold:   s.cfg.BalanceAbsThreshold,
+			BalanceRelThreshold:   s.cfg.BalanceRelThreshold,
+			CacheThreshold:        s.cfg.CacheThreshold,
+			WaitingThreshold:      s.cfg.WaitingThreshold,
+			MetricsScrapeInterval: s.cfg.MetricsScrapeInterval,
+			MetricsScrapeTimeout:  s.cfg.MetricsScrapeTimeout,
+			WorkerMetricsPath:     s.cfg.WorkerMetricsPath,
+			ExtraArgs:             s.cfg.ExtraArgs,
 		},
 		Target: config.TargetConfig{
 			ModelName:  s.cfg.ModelName,
@@ -2021,6 +2182,7 @@ func (s *Server) getConfigLocked() *dashboard.ConfigSnapshot {
 			BalanceAbsThreshold: r.BalanceAbsThreshold,
 			BalanceRelThreshold: r.BalanceRelThreshold,
 			CacheThreshold:      r.CacheThreshold,
+			WaitingThreshold:    r.WaitingThreshold,
 			ExtraArgs:           r.ExtraArgs,
 		})
 	}
@@ -2055,26 +2217,37 @@ func (s *Server) getConfigLocked() *dashboard.ConfigSnapshot {
 		cbEnabled = *s.cfg.CircuitBreaker.Enabled
 	}
 
+	scrapeSecs := int(s.cfg.MetricsScrapeInterval.Seconds())
+	if scrapeSecs <= 0 {
+		scrapeSecs = 1
+	}
+	waitThreshVal := DefaultWaitingThreshold
+	if s.cfg.WaitingThreshold != nil {
+		waitThreshVal = *s.cfg.WaitingThreshold
+	}
+
 	return &dashboard.ConfigSnapshot{
-		Mode:                    "proxy",
-		Policy:                  string(s.cfg.Policy),
-		WatchIntervalSecs:       int(s.cfg.WatchInterval.Seconds()),
-		ZeroDowntime:            s.cfg.ZeroDowntime,
-		DrainTimeoutSecs:        int(s.cfg.DrainTimeout.Seconds()),
-		BalanceAbsThreshold:     s.cfg.BalanceAbsThreshold,
-		BalanceRelThreshold:     s.cfg.BalanceRelThreshold,
-		CacheThreshold:          s.cfg.CacheThreshold,
-		ExtraArgs:               s.cfg.ExtraArgs,
-		CircuitBreakerEnabled:   cbEnabled,
-		MaxFailures:             s.cfg.CircuitBreaker.MaxFailures,
-		CooldownSecs:            int(s.cfg.CircuitBreaker.Cooldown.Seconds()),
-		MaxRetries:              s.cfg.CircuitBreaker.MaxRetries,
-		HealthCheckIntervalSecs: int(s.cfg.CircuitBreaker.HealthCheckInterval.Seconds()),
-		SuccessThreshold:        s.cfg.CircuitBreaker.SuccessThreshold,
-		Models:                  models,
-		AvailablePolicies:       []string{"consistent_hash", "cache_aware", "rendezvous_hash", "round_robin", "power_of_two", "random"},
-		AvailableModes:          []string{"proxy", "run"},
-		ConfigFilePath:          s.configFilePath,
+		Mode:                      "proxy",
+		Policy:                    string(s.cfg.Policy),
+		WatchIntervalSecs:         int(s.cfg.WatchInterval.Seconds()),
+		ZeroDowntime:              s.cfg.ZeroDowntime,
+		DrainTimeoutSecs:          int(s.cfg.DrainTimeout.Seconds()),
+		BalanceAbsThreshold:       s.cfg.BalanceAbsThreshold,
+		BalanceRelThreshold:       s.cfg.BalanceRelThreshold,
+		CacheThreshold:            s.cfg.CacheThreshold,
+		WaitingThreshold:          &waitThreshVal,
+		MetricsScrapeIntervalSecs: &scrapeSecs,
+		ExtraArgs:                 s.cfg.ExtraArgs,
+		CircuitBreakerEnabled:     cbEnabled,
+		MaxFailures:               s.cfg.CircuitBreaker.MaxFailures,
+		CooldownSecs:              int(s.cfg.CircuitBreaker.Cooldown.Seconds()),
+		MaxRetries:                s.cfg.CircuitBreaker.MaxRetries,
+		HealthCheckIntervalSecs:   int(s.cfg.CircuitBreaker.HealthCheckInterval.Seconds()),
+		SuccessThreshold:          s.cfg.CircuitBreaker.SuccessThreshold,
+		Models:                    models,
+		AvailablePolicies:         []string{"consistent_hash", "cache_aware", "rendezvous_hash", "round_robin", "power_of_two", "least_waiting", "random"},
+		AvailableModes:            []string{"proxy", "run"},
+		ConfigFilePath:            s.configFilePath,
 	}
 }
 

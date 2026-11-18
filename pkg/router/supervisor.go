@@ -28,6 +28,7 @@ import (
 	"gpu-vllm-router/pkg/gpustack"
 	"gpu-vllm-router/pkg/logger"
 	"gpu-vllm-router/pkg/swagger"
+	"gpu-vllm-router/pkg/workermetrics"
 )
 
 // WorkerBreaker tracks health and circuit breaker status of a backend worker instance in mode: run.
@@ -41,19 +42,24 @@ type WorkerBreaker struct {
 	TotalSuccesses   int64     `json:"total_successes"`
 	TotalFailures    int64     `json:"total_failures"`
 	RunningRequests  int64     `json:"running_requests"`
+	RunningAtScrape  int64     `json:"-"`
 }
 
 // SupervisorConfig defines configuration for the router supervisor.
 type SupervisorConfig struct {
-	ZeroDowntime        bool
-	PublicHost          string
-	PublicPort          int
-	MetricsPort         int
-	DrainTimeout        time.Duration
-	HealthCheckTimeout  time.Duration
-	WatchInterval       time.Duration
-	WorkerProbeInterval time.Duration
-	WorkerMaxFailures   int
+	ZeroDowntime          bool
+	PublicHost            string
+	PublicPort            int
+	MetricsPort           int
+	DrainTimeout          time.Duration
+	HealthCheckTimeout    time.Duration
+	WatchInterval         time.Duration
+	WorkerProbeInterval   time.Duration
+	WorkerMaxFailures     int
+	WaitingThreshold      *int
+	MetricsScrapeInterval time.Duration
+	MetricsScrapeTimeout  time.Duration
+	WorkerMetricsPath     string
 
 	RouterCfg      Config
 	ConfigFilePath string
@@ -78,6 +84,7 @@ type ModelRunner struct {
 	ActiveURLs   []string
 	AllURLs      []string
 	activeConns  int64
+	rrCursor     uint64
 	reloading    bool
 }
 
@@ -105,6 +112,7 @@ type Supervisor struct {
 	endpointsMu   sync.RWMutex
 	endpointsMeta map[string]gpustack.WorkerEndpoint
 	autoHealer    *gpustack.AutoHealer
+	metricsStore  *workermetrics.Store
 
 	frontServer   *http.Server
 	metricsServer *http.Server
@@ -162,6 +170,15 @@ func NewSupervisor(client *gpustack.Client, modelName string, cfg SupervisorConf
 	if cfg.WorkerMaxFailures <= 0 {
 		cfg.WorkerMaxFailures = 3
 	}
+	if cfg.MetricsScrapeInterval <= 0 {
+		cfg.MetricsScrapeInterval = 1 * time.Second
+	}
+	if cfg.MetricsScrapeTimeout <= 0 {
+		cfg.MetricsScrapeTimeout = 1500 * time.Millisecond
+	}
+	if cfg.WorkerMetricsPath == "" {
+		cfg.WorkerMetricsPath = "/metrics"
+	}
 
 	rulesMap := make(map[string]config.ModelRule)
 	for _, r := range cfg.ModelRules {
@@ -170,7 +187,13 @@ func NewSupervisor(client *gpustack.Client, modelName string, cfg SupervisorConf
 	}
 	cfg.RouterCfg.WorkerURLs = config.NormalizeWorkerURLs(cfg.RouterCfg.WorkerURLs)
 
-	return &Supervisor{
+	metricsStore := workermetrics.NewStore(workermetrics.Config{
+		ScrapeInterval: cfg.MetricsScrapeInterval,
+		ScrapeTimeout:  cfg.MetricsScrapeTimeout,
+		MetricsPath:    cfg.WorkerMetricsPath,
+	})
+
+	sup := &Supervisor{
 		client:         client,
 		modelName:      modelName,
 		cfg:            cfg,
@@ -178,11 +201,24 @@ func NewSupervisor(client *gpustack.Client, modelName string, cfg SupervisorConf
 		workerStates:   make(map[string]*WorkerBreaker),
 		endpointsMeta:  make(map[string]gpustack.WorkerEndpoint),
 		autoHealer:     gpustack.NewAutoHealer(client, cfg.AutoHeal),
+		metricsStore:   metricsStore,
 		stopCh:         make(chan struct{}),
 		configFilePath: cfg.ConfigFilePath,
 		modelRules:     rulesMap,
 		transport:      NewOptimizedTransport(),
 	}
+
+	metricsStore.SetOnScrape(func(workerURL string, _ workermetrics.WorkerMetrics) {
+		sup.workerMu.RLock()
+		for u, wb := range sup.workerStates {
+			if strings.TrimRight(u, "/") == workerURL && wb != nil {
+				atomic.StoreInt64(&wb.RunningAtScrape, atomic.LoadInt64(&wb.RunningRequests))
+			}
+		}
+		sup.workerMu.RUnlock()
+	})
+
+	return sup
 }
 
 func (s *Supervisor) initWorkers(urls []string) {
@@ -242,6 +278,10 @@ func (s *Supervisor) syncWorkers(activeURLs []string) {
 		}
 	}
 	s.endpointsMu.Unlock()
+
+	if s.metricsStore != nil {
+		s.metricsStore.SetWorkerURLs(activeURLs)
+	}
 }
 
 func (s *Supervisor) recordEndpointsMeta(endpoints []gpustack.WorkerEndpoint) {
@@ -658,9 +698,12 @@ func (s *Supervisor) Start(ctx context.Context) error {
 		}
 	}()
 
-	// Start dynamic watch loop and proactive worker probe loop
+	// Start dynamic watch loop, proactive worker probe loop, and worker /metrics scraper loop
 	go s.watchLoop(ctx)
 	go s.workerProbeLoop(ctx)
+	if s.metricsStore != nil {
+		go s.metricsStore.Run(ctx, s.stopCh)
+	}
 	return nil
 }
 
@@ -688,6 +731,11 @@ func (s *Supervisor) startModelRunner(ctx context.Context, modelName string, wor
 		}
 	}
 	s.mu.RUnlock()
+
+	if rulePolicy == PolicyLeastWaiting && ruleMode != "proxy" {
+		log.Printf("[Supervisor] Policy 'least_waiting' runs natively in Go proxy mode; routing model [%s] in direct 'proxy' mode.", modelName)
+		ruleMode = "proxy"
+	}
 
 	if ruleMode == "proxy" {
 		log.Printf("[Supervisor] Launching model [%s] in direct 'proxy' mode (Workers: %d, Policy: %s)...",
@@ -808,12 +856,26 @@ func (s *Supervisor) handleSupervisorStatus(w http.ResponseWriter, r *http.Reque
 		if !wb.OpenSince.IsZero() {
 			openSinceStr = wb.OpenSince.Format(time.RFC3339)
 		}
+		var runReq, waitReq, kvUsage float64
+		var metricsOK bool
+		if s.metricsStore != nil {
+			if m, ok := s.metricsStore.Get(u); ok {
+				runReq = m.Running
+				waitReq = m.Waiting
+				kvUsage = m.KVCacheUsage
+				metricsOK = true
+			}
+		}
 		workersMap[u] = map[string]interface{}{
 			"healthy":           wb.Healthy,
 			"consecutive_fails": wb.ConsecutiveFails,
 			"last_probe":        wb.LastProbe.Format(time.RFC3339),
 			"last_error":        wb.LastErr,
 			"open_since":        openSinceStr,
+			"running_requests":  runReq,
+			"waiting_requests":  waitReq,
+			"kv_cache_usage":    kvUsage,
+			"metrics_available": metricsOK,
 		}
 	}
 	s.workerMu.RUnlock()
@@ -937,6 +999,34 @@ func (s *Supervisor) handleMetrics(w http.ResponseWriter, r *http.Request) {
 	}
 	buf.WriteString("\n")
 
+	if s.metricsStore != nil {
+		buf.WriteString("# HELP gpu_router_worker_waiting_requests Scraped waiting requests in worker inference queue\n")
+		buf.WriteString("# TYPE gpu_router_worker_waiting_requests gauge\n")
+		for u := range workers {
+			if m, ok := s.metricsStore.Get(u); ok {
+				mName := workerToModel[u]
+				if mName == "" && s.modelName != "" {
+					mName = s.modelName
+				}
+				fmt.Fprintf(&buf, "gpu_router_worker_waiting_requests{model=%q,worker=%q} %g\n", mName, u, m.Waiting)
+			}
+		}
+		buf.WriteString("\n")
+
+		buf.WriteString("# HELP gpu_router_worker_running_requests Scraped running requests on worker inference engine\n")
+		buf.WriteString("# TYPE gpu_router_worker_running_requests gauge\n")
+		for u := range workers {
+			if m, ok := s.metricsStore.Get(u); ok {
+				mName := workerToModel[u]
+				if mName == "" && s.modelName != "" {
+					mName = s.modelName
+				}
+				fmt.Fprintf(&buf, "gpu_router_worker_running_requests{model=%q,worker=%q} %g\n", mName, u, m.Running)
+			}
+		}
+		buf.WriteString("\n")
+	}
+
 	w.Header().Set("Content-Type", "text/plain; version=0.0.4")
 	_, _ = w.Write(buf.Bytes())
 }
@@ -1024,23 +1114,20 @@ func (s *Supervisor) handleProxy(w http.ResponseWriter, req *http.Request) {
 			healthyURLs = activeURLs
 		}
 
-		idx := int(atomic.AddInt64(&runner.activeConns, 1)) % len(healthyURLs)
-		if idx < 0 {
-			idx = -idx
-		}
-		chosenURL := healthyURLs[idx]
+		atomic.AddInt64(&runner.activeConns, 1)
+		chosenURL := s.selectProxyWorker(runner, healthyURLs)
 
-		s.workerMu.Lock()
+		s.workerMu.RLock()
 		if wb, ok := s.workerStates[chosenURL]; ok {
 			atomic.AddInt64(&wb.RunningRequests, 1)
 		}
-		s.workerMu.Unlock()
+		s.workerMu.RUnlock()
 		defer func() {
-			s.workerMu.Lock()
+			s.workerMu.RLock()
 			if wb, ok := s.workerStates[chosenURL]; ok {
 				atomic.AddInt64(&wb.RunningRequests, -1)
 			}
-			s.workerMu.Unlock()
+			s.workerMu.RUnlock()
 		}()
 
 		s.endpointsMu.RLock()
@@ -1243,6 +1330,57 @@ func (s *Supervisor) handleProxy(w http.ResponseWriter, req *http.Request) {
 	}
 
 	proxy.ServeHTTP(w, req)
+}
+
+func (s *Supervisor) selectProxyWorker(runner *ModelRunner, healthyURLs []string) string {
+	n := len(healthyURLs)
+	if n == 0 {
+		return ""
+	}
+	if n == 1 {
+		return healthyURLs[0]
+	}
+
+	start := int(atomic.AddUint64(&runner.rrCursor, 1) % uint64(n))
+	runner.mu.RLock()
+	policy := runner.Policy
+	runner.mu.RUnlock()
+
+	if policy != PolicyLeastWaiting {
+		return healthyURLs[start]
+	}
+
+	workerLoad := func(u string) (waiting, running float64, active int64) {
+		s.workerMu.RLock()
+		wb := s.workerStates[u]
+		s.workerMu.RUnlock()
+		var delta int64
+		if wb != nil {
+			active = atomic.LoadInt64(&wb.RunningRequests)
+			delta = active - atomic.LoadInt64(&wb.RunningAtScrape)
+			if delta < 0 {
+				delta = 0
+			}
+		}
+		if s.metricsStore != nil {
+			if m, ok := s.metricsStore.Get(u); ok {
+				return m.Waiting + float64(delta), m.Running + float64(delta), active
+			}
+		}
+		return float64(active), float64(active), active
+	}
+
+	bestURL := healthyURLs[start]
+	bestW, bestR, bestA := workerLoad(bestURL)
+	for i := 1; i < n; i++ {
+		cand := healthyURLs[(start+i)%n]
+		w, r, a := workerLoad(cand)
+		if w < bestW || (w == bestW && r < bestR) || (w == bestW && r == bestR && a < bestA) {
+			bestURL = cand
+			bestW, bestR, bestA = w, r, a
+		}
+	}
+	return bestURL
 }
 
 func (s *Supervisor) spawnProcess(ctx context.Context, host string, port int, workerURLs []string) (*runningProcess, error) {
@@ -2060,9 +2198,28 @@ func (s *Supervisor) GetTopology(ctx context.Context) (*dashboard.TopologyData, 
 				modelHealthy++
 			}
 
+			var activeConns int64
+			if wb != nil {
+				activeConns = atomic.LoadInt64(&wb.RunningRequests)
+			}
+			var runReq, waitReq, kvUsage float64
+			var metricsOK bool
+			if s.metricsStore != nil {
+				if m, ok := s.metricsStore.Get(u); ok {
+					runReq = m.Running
+					waitReq = m.Waiting
+					kvUsage = m.KVCacheUsage
+					metricsOK = true
+				}
+			}
+
 			workersTopo = append(workersTopo, dashboard.WorkerTopology{
 				URL:                 u,
-				ActiveConns:         0,
+				ActiveConns:         activeConns,
+				RunningRequests:     runReq,
+				WaitingRequests:     waitReq,
+				KVCacheUsage:        kvUsage,
+				MetricsAvailable:    metricsOK,
 				Healthy:             isHealthy,
 				CircuitState:        state,
 				ConsecutiveFailures: fails,
@@ -2216,6 +2373,12 @@ func (s *Supervisor) UpdateConfig(ctx context.Context, req dashboard.ConfigUpdat
 	if req.CacheThreshold != nil {
 		s.cfg.RouterCfg.CacheThreshold = *req.CacheThreshold
 	}
+	if req.WaitingThreshold != nil {
+		s.cfg.WaitingThreshold = req.WaitingThreshold
+	}
+	if req.MetricsScrapeIntervalSecs != nil && *req.MetricsScrapeIntervalSecs > 0 {
+		s.cfg.MetricsScrapeInterval = time.Duration(*req.MetricsScrapeIntervalSecs) * time.Second
+	}
 	if req.ExtraArgs != nil {
 		s.cfg.RouterCfg.ExtraArgs = req.ExtraArgs
 	}
@@ -2236,6 +2399,7 @@ func (s *Supervisor) UpdateConfig(ctx context.Context, req dashboard.ConfigUpdat
 				BalanceAbsThreshold: m.BalanceAbsThreshold,
 				BalanceRelThreshold: m.BalanceRelThreshold,
 				CacheThreshold:      m.CacheThreshold,
+				WaitingThreshold:    m.WaitingThreshold,
 				ExtraArgs:           m.ExtraArgs,
 			}
 			s.modelRules[m.ModelName] = rule
@@ -2267,6 +2431,7 @@ func (s *Supervisor) UpdateModelRule(ctx context.Context, req dashboard.ModelRul
 		BalanceAbsThreshold: req.BalanceAbsThreshold,
 		BalanceRelThreshold: req.BalanceRelThreshold,
 		CacheThreshold:      req.CacheThreshold,
+		WaitingThreshold:    req.WaitingThreshold,
 		ExtraArgs:           req.ExtraArgs,
 	}
 	s.modelRules[req.ModelName] = rule
@@ -2322,6 +2487,10 @@ func (s *Supervisor) applyModelRuleLocked(ctx context.Context, rule config.Model
 	targetPolicy := Policy(rule.Policy)
 	if targetPolicy == "" {
 		targetPolicy = s.cfg.RouterCfg.Policy
+	}
+	if targetPolicy == PolicyLeastWaiting && targetMode != "proxy" {
+		log.Printf("[Supervisor] Policy 'least_waiting' runs natively in Go proxy mode; switching [%s] to proxy mode.", runner.ModelName)
+		targetMode = "proxy"
 	}
 
 	prevMode := runner.Mode
@@ -2415,16 +2584,20 @@ func (s *Supervisor) saveConfigToFileLocked() error {
 
 	cfgToSave := &config.FileConfig{
 		Router: config.RouterConfig{
-			Mode:                "run",
-			Host:                s.cfg.PublicHost,
-			Port:                s.cfg.PublicPort,
-			WatchInterval:       s.cfg.WatchInterval,
-			ZeroDowntime:        &s.cfg.ZeroDowntime,
-			DrainTimeout:        s.cfg.DrainTimeout,
-			BalanceAbsThreshold: balAbs,
-			BalanceRelThreshold: balRel,
-			CacheThreshold:      cacheThresh,
-			ExtraArgs:           s.cfg.RouterCfg.ExtraArgs,
+			Mode:                  "run",
+			Host:                  s.cfg.PublicHost,
+			Port:                  s.cfg.PublicPort,
+			WatchInterval:         s.cfg.WatchInterval,
+			ZeroDowntime:          &s.cfg.ZeroDowntime,
+			DrainTimeout:          s.cfg.DrainTimeout,
+			BalanceAbsThreshold:   balAbs,
+			BalanceRelThreshold:   balRel,
+			CacheThreshold:        cacheThresh,
+			WaitingThreshold:      s.cfg.WaitingThreshold,
+			MetricsScrapeInterval: s.cfg.MetricsScrapeInterval,
+			MetricsScrapeTimeout:  s.cfg.MetricsScrapeTimeout,
+			WorkerMetricsPath:     s.cfg.WorkerMetricsPath,
+			ExtraArgs:             s.cfg.RouterCfg.ExtraArgs,
 		},
 		Target: config.TargetConfig{
 			ModelName:  s.modelName,
@@ -2455,6 +2628,7 @@ func (s *Supervisor) getConfigLocked() *dashboard.ConfigSnapshot {
 			BalanceAbsThreshold: r.BalanceAbsThreshold,
 			BalanceRelThreshold: r.BalanceRelThreshold,
 			CacheThreshold:      r.CacheThreshold,
+			WaitingThreshold:    r.WaitingThreshold,
 			ExtraArgs:           r.ExtraArgs,
 		})
 	}
@@ -2503,26 +2677,33 @@ func (s *Supervisor) getConfigLocked() *dashboard.ConfigSnapshot {
 		cacheThresh = &v
 	}
 
+	scrapeSecs := int(s.cfg.MetricsScrapeInterval.Seconds())
+	if scrapeSecs <= 0 {
+		scrapeSecs = 1
+	}
+
 	return &dashboard.ConfigSnapshot{
-		Mode:                    "run",
-		Policy:                  string(s.cfg.RouterCfg.Policy),
-		WatchIntervalSecs:       int(s.cfg.WatchInterval.Seconds()),
-		ZeroDowntime:            s.cfg.ZeroDowntime,
-		DrainTimeoutSecs:        int(s.cfg.DrainTimeout.Seconds()),
-		BalanceAbsThreshold:     balAbs,
-		BalanceRelThreshold:     balRel,
-		CacheThreshold:          cacheThresh,
-		ExtraArgs:               s.cfg.RouterCfg.ExtraArgs,
-		CircuitBreakerEnabled:   true,
-		MaxFailures:             s.cfg.WorkerMaxFailures,
-		CooldownSecs:            10,
-		MaxRetries:              2,
-		HealthCheckIntervalSecs: int(s.cfg.WorkerProbeInterval.Seconds()),
-		SuccessThreshold:        2,
-		Models:                  models,
-		AvailablePolicies:       []string{"consistent_hash", "cache_aware", "rendezvous_hash", "round_robin", "power_of_two", "random"},
-		AvailableModes:          []string{"proxy", "run"},
-		ConfigFilePath:          s.configFilePath,
+		Mode:                      "run",
+		Policy:                    string(s.cfg.RouterCfg.Policy),
+		WatchIntervalSecs:         int(s.cfg.WatchInterval.Seconds()),
+		ZeroDowntime:              s.cfg.ZeroDowntime,
+		DrainTimeoutSecs:          int(s.cfg.DrainTimeout.Seconds()),
+		BalanceAbsThreshold:       balAbs,
+		BalanceRelThreshold:       balRel,
+		CacheThreshold:            cacheThresh,
+		WaitingThreshold:          s.cfg.WaitingThreshold,
+		MetricsScrapeIntervalSecs: &scrapeSecs,
+		ExtraArgs:                 s.cfg.RouterCfg.ExtraArgs,
+		CircuitBreakerEnabled:     true,
+		MaxFailures:               s.cfg.WorkerMaxFailures,
+		CooldownSecs:              10,
+		MaxRetries:                2,
+		HealthCheckIntervalSecs:   int(s.cfg.WorkerProbeInterval.Seconds()),
+		SuccessThreshold:          2,
+		Models:                    models,
+		AvailablePolicies:         []string{"consistent_hash", "cache_aware", "rendezvous_hash", "round_robin", "power_of_two", "least_waiting", "random"},
+		AvailableModes:            []string{"proxy", "run"},
+		ConfigFilePath:            s.configFilePath,
 	}
 }
 
