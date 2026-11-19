@@ -49,6 +49,7 @@ type RouterConfig struct {
 	MaxPayloadSize             *int          `yaml:"max_payload_size,omitempty"`
 	WorkerStartupTimeoutSecs   *int          `yaml:"worker_startup_timeout_secs,omitempty"`
 	WorkerStartupCheckInterval *int          `yaml:"worker_startup_check_interval,omitempty"`
+	RequestTimeoutSecs         *int          `yaml:"request_timeout_secs,omitempty"`
 	VllmPDDisagg               *bool         `yaml:"vllm_pd_disaggregation,omitempty"`
 	VllmDiscoveryAddress       string        `yaml:"vllm_discovery_address,omitempty"`
 	PrefillPolicy              string        `yaml:"prefill_policy,omitempty"`
@@ -73,6 +74,9 @@ type CircuitBreakerConfig struct {
 	WindowDuration         time.Duration `yaml:"window_duration"`
 	MaxRetries             int           `yaml:"max_retries"`
 	RetryInitialBackoff    time.Duration `yaml:"retry_initial_backoff"`
+	RetryMaxBackoff        time.Duration `yaml:"retry_max_backoff,omitempty"`
+	RetryBackoffMultiplier *float64      `yaml:"retry_backoff_multiplier,omitempty"`
+	RetryJitterFactor      *float64      `yaml:"retry_jitter_factor,omitempty"`
 	HealthCheckInterval    time.Duration `yaml:"health_check_interval"`
 	HealthCheckTimeout     time.Duration `yaml:"health_check_timeout"`
 	HealthFailureThreshold int           `yaml:"health_failure_threshold,omitempty"`
@@ -122,6 +126,7 @@ type ModelRule struct {
 	BalanceRelThreshold *float64 `yaml:"balance_rel_threshold,omitempty" json:"balance_rel_threshold,omitempty"`
 	CacheThreshold      *float64 `yaml:"cache_threshold,omitempty" json:"cache_threshold,omitempty"`
 	WaitingThreshold    *int     `yaml:"waiting_threshold,omitempty" json:"waiting_threshold,omitempty"`
+	RequestTimeoutSecs  *int     `yaml:"request_timeout_secs,omitempty" json:"request_timeout_secs,omitempty"`
 	LogDir              string   `yaml:"log_dir,omitempty" json:"log_dir,omitempty"`
 	ExtraArgs           []string `yaml:"extra_args,omitempty" json:"extra_args,omitempty"`
 }

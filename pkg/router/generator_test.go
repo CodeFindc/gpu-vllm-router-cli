@@ -236,3 +236,46 @@ func TestBuildArgsWithPDAndAdvancedTuning(t *testing.T) {
 	}
 }
 
+func TestBuildArgsWithRequestTimeoutAndFullRetryOptions(t *testing.T) {
+	jitter := 0.25
+	cfg := Config{
+		Host:                   "0.0.0.0",
+		Port:                   8000,
+		WorkerURLs:             []string{"http://10.0.0.1:8000"},
+		RequestTimeoutSecs:     1800,
+		RetryMaxRetries:        5,
+		RetryInitialBackoffMs:  100,
+		RetryMaxBackoffMs:      30000,
+		RetryBackoffMultiplier: 1.5,
+		RetryJitterFactor:      &jitter,
+	}
+
+	cmdStr := strings.Join(BuildArgs(cfg), " ")
+	expectedFlags := []string{
+		"--request-timeout-secs 1800",
+		"--retry-max-retries 5",
+		"--retry-initial-backoff-ms 100",
+		"--retry-max-backoff-ms 30000",
+		"--retry-backoff-multiplier 1.5",
+		"--retry-jitter-factor 0.25",
+	}
+	for _, flag := range expectedFlags {
+		if !strings.Contains(cmdStr, flag) {
+			t.Errorf("expected command string to contain %q, got: %s", flag, cmdStr)
+		}
+	}
+
+	// Verify explicit 0.0 jitter factor is emitted
+	zeroJitter := 0.0
+	cfgZero := Config{
+		Host:              "0.0.0.0",
+		Port:              8000,
+		WorkerURLs:        []string{"http://10.0.0.1:8000"},
+		RetryJitterFactor: &zeroJitter,
+	}
+	zeroStr := strings.Join(BuildArgs(cfgZero), " ")
+	if !strings.Contains(zeroStr, "--retry-jitter-factor 0") {
+		t.Errorf("expected --retry-jitter-factor 0 when explicitly set to 0, got: %s", zeroStr)
+	}
+}
+

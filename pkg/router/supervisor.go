@@ -1414,6 +1414,9 @@ func (s *Supervisor) buildModelConfig(modelName string, host string, port int, w
 			if rule.CacheThreshold != nil && *rule.CacheThreshold > 0 {
 				cfg.CacheThreshold = *rule.CacheThreshold
 			}
+			if rule.RequestTimeoutSecs != nil && *rule.RequestTimeoutSecs > 0 {
+				cfg.RequestTimeoutSecs = *rule.RequestTimeoutSecs
+			}
 			if rule.LogDir != "" {
 				cfg.LogDir = rule.LogDir
 				hasCustomLogDir = true
@@ -2581,6 +2584,26 @@ func (s *Supervisor) saveConfigToFileLocked() error {
 		v := s.cfg.RouterCfg.CacheThreshold
 		cacheThresh = &v
 	}
+	var reqTimeout *int
+	if s.cfg.RouterCfg.RequestTimeoutSecs > 0 {
+		v := s.cfg.RouterCfg.RequestTimeoutSecs
+		reqTimeout = &v
+	}
+	var retryBackoffMult *float64
+	if s.cfg.RouterCfg.RetryBackoffMultiplier > 0 {
+		v := s.cfg.RouterCfg.RetryBackoffMultiplier
+		retryBackoffMult = &v
+	}
+	var disableCB *bool
+	if s.cfg.RouterCfg.DisableCircuitBreaker {
+		v := true
+		disableCB = &v
+	}
+	var disableRetries *bool
+	if s.cfg.RouterCfg.DisableRetries {
+		v := true
+		disableRetries = &v
+	}
 
 	cfgToSave := &config.FileConfig{
 		Router: config.RouterConfig{
@@ -2593,6 +2616,7 @@ func (s *Supervisor) saveConfigToFileLocked() error {
 			BalanceAbsThreshold:   balAbs,
 			BalanceRelThreshold:   balRel,
 			CacheThreshold:        cacheThresh,
+			RequestTimeoutSecs:    reqTimeout,
 			WaitingThreshold:      s.cfg.WaitingThreshold,
 			MetricsScrapeInterval: s.cfg.MetricsScrapeInterval,
 			MetricsScrapeTimeout:  s.cfg.MetricsScrapeTimeout,
@@ -2605,8 +2629,15 @@ func (s *Supervisor) saveConfigToFileLocked() error {
 			WorkerURLs: s.cfg.RouterCfg.WorkerURLs,
 		},
 		CircuitBreaker: config.CircuitBreakerConfig{
-			MaxFailures:         s.cfg.WorkerMaxFailures,
-			HealthCheckInterval: s.cfg.WorkerProbeInterval,
+			MaxFailures:            s.cfg.WorkerMaxFailures,
+			MaxRetries:             s.cfg.RouterCfg.RetryMaxRetries,
+			RetryInitialBackoff:    time.Duration(s.cfg.RouterCfg.RetryInitialBackoffMs) * time.Millisecond,
+			RetryMaxBackoff:        time.Duration(s.cfg.RouterCfg.RetryMaxBackoffMs) * time.Millisecond,
+			RetryBackoffMultiplier: retryBackoffMult,
+			RetryJitterFactor:      s.cfg.RouterCfg.RetryJitterFactor,
+			HealthCheckInterval:    s.cfg.WorkerProbeInterval,
+			DisableCircuitBreaker:  disableCB,
+			DisableRetries:         disableRetries,
 		},
 	}
 

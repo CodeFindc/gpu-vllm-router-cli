@@ -35,9 +35,10 @@ type Config struct {
 	MaxTreeSize         int     `json:"max_tree_size,omitempty"`         // --max-tree-size
 	MaxPayloadSize      int     `json:"max_payload_size,omitempty"`      // --max-payload-size
 
-	// Worker startup flags
+	// Worker startup & request timeout flags
 	WorkerStartupTimeoutSecs   int `json:"worker_startup_timeout_secs,omitempty"`   // --worker-startup-timeout-secs
 	WorkerStartupCheckInterval int `json:"worker_startup_check_interval,omitempty"` // --worker-startup-check-interval
+	RequestTimeoutSecs         int `json:"request_timeout_secs,omitempty"`          // --request-timeout-secs
 
 	// Authentication & Security
 	APIKey               string   `json:"api_key,omitempty"`                 // --api-key
@@ -51,9 +52,12 @@ type Config struct {
 	DisableCircuitBreaker bool `json:"disable_circuit_breaker,omitempty"`  // --disable-circuit-breaker
 
 	// Built-in Retry options for official vllm-router
-	RetryMaxRetries       int  `json:"retry_max_retries,omitempty"`        // --retry-max-retries
-	RetryInitialBackoffMs int  `json:"retry_initial_backoff_ms,omitempty"` // --retry-initial-backoff-ms
-	DisableRetries        bool `json:"disable_retries,omitempty"`          // --disable-retries
+	RetryMaxRetries        int      `json:"retry_max_retries,omitempty"`        // --retry-max-retries
+	RetryInitialBackoffMs  int      `json:"retry_initial_backoff_ms,omitempty"` // --retry-initial-backoff-ms
+	RetryMaxBackoffMs      int      `json:"retry_max_backoff_ms,omitempty"`     // --retry-max-backoff-ms
+	RetryBackoffMultiplier float64  `json:"retry_backoff_multiplier,omitempty"` // --retry-backoff-multiplier
+	RetryJitterFactor      *float64 `json:"retry_jitter_factor,omitempty"`      // --retry-jitter-factor
+	DisableRetries         bool     `json:"disable_retries,omitempty"`          // --disable-retries
 
 	// Built-in Health Check options for official vllm-router
 	HealthFailureThreshold  int    `json:"health_failure_threshold,omitempty"`   // --health-failure-threshold
@@ -134,12 +138,15 @@ func BuildArgs(cfg Config) []string {
 		args = append(args, cfg.WorkerURLs...)
 	}
 
-	// Worker startup flags
+	// Worker startup & request timeout flags
 	if cfg.WorkerStartupTimeoutSecs > 0 {
 		args = append(args, "--worker-startup-timeout-secs", strconv.Itoa(cfg.WorkerStartupTimeoutSecs))
 	}
 	if cfg.WorkerStartupCheckInterval > 0 {
 		args = append(args, "--worker-startup-check-interval", strconv.Itoa(cfg.WorkerStartupCheckInterval))
+	}
+	if cfg.RequestTimeoutSecs > 0 {
+		args = append(args, "--request-timeout-secs", strconv.Itoa(cfg.RequestTimeoutSecs))
 	}
 
 	// Load balancing threshold & cache tuning flags for official vllm-router
@@ -194,6 +201,15 @@ func BuildArgs(cfg Config) []string {
 	}
 	if cfg.RetryInitialBackoffMs > 0 {
 		args = append(args, "--retry-initial-backoff-ms", fmt.Sprintf("%d", cfg.RetryInitialBackoffMs))
+	}
+	if cfg.RetryMaxBackoffMs > 0 {
+		args = append(args, "--retry-max-backoff-ms", fmt.Sprintf("%d", cfg.RetryMaxBackoffMs))
+	}
+	if cfg.RetryBackoffMultiplier > 0 {
+		args = append(args, "--retry-backoff-multiplier", strconv.FormatFloat(cfg.RetryBackoffMultiplier, 'f', -1, 64))
+	}
+	if cfg.RetryJitterFactor != nil && *cfg.RetryJitterFactor >= 0 {
+		args = append(args, "--retry-jitter-factor", strconv.FormatFloat(*cfg.RetryJitterFactor, 'f', -1, 64))
 	}
 	if cfg.DisableRetries {
 		args = append(args, "--disable-retries")

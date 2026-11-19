@@ -55,6 +55,7 @@ type ServerConfig struct {
 	Backend               string
 	LogLevel              string
 	LogDir                string
+	BaseRouterCfg         router.Config
 	AutoHeal              config.AutoHealConfig
 }
 
@@ -2073,19 +2074,29 @@ func (s *Server) startRunnerForPool(pool *ModelPool, urls []string) error {
 		}
 	}
 
-	cfg := router.Config{
-		RouterBin:           routerBin,
-		Host:                "127.0.0.1",
-		Port:                freePort,
-		Policy:              pool.Policy,
-		WorkerURLs:          urls,
-		Backend:             backend,
-		LogLevel:            logLevel,
-		LogDir:              logDir,
-		BalanceAbsThreshold: balAbs,
-		BalanceRelThreshold: balRel,
-		CacheThreshold:      cacheThresh,
-		ExtraArgs:           extraArgs,
+	cfg := s.cfg.BaseRouterCfg
+	cfg.RouterBin = routerBin
+	cfg.Host = "127.0.0.1"
+	cfg.Port = freePort
+	cfg.Policy = pool.Policy
+	cfg.WorkerURLs = urls
+	cfg.Backend = backend
+	cfg.LogLevel = logLevel
+	cfg.LogDir = logDir
+	if balAbs > 0 {
+		cfg.BalanceAbsThreshold = balAbs
+	}
+	if balRel > 0 {
+		cfg.BalanceRelThreshold = balRel
+	}
+	if cacheThresh > 0 {
+		cfg.CacheThreshold = cacheThresh
+	}
+	if hasRule && rule.RequestTimeoutSecs != nil && *rule.RequestTimeoutSecs > 0 {
+		cfg.RequestTimeoutSecs = *rule.RequestTimeoutSecs
+	}
+	if len(extraArgs) > 0 {
+		cfg.ExtraArgs = extraArgs
 	}
 	args := router.BuildArgs(cfg)
 	log.Printf("[Proxy] Spawning %s on 127.0.0.1:%d (Model: %q, Workers: %d, Policy: %s, LogLevel: %s, LogDir: %q)",

@@ -143,9 +143,10 @@ func main() {
 	prefillPolicyFlag := flag.String("prefill-policy", "", "PD 模式下 Prefill 节点调度策略")
 	decodePolicyFlag := flag.String("decode-policy", "", "PD 模式下 Decode 节点调度策略")
 
-	// Worker startup flags
+	// Worker startup & request timeout flags
 	workerStartupTimeoutFlag := flag.Int("worker-startup-timeout-secs", 0, "Worker 实例启动等待超时时间秒数")
 	workerStartupCheckIntervalFlag := flag.Int("worker-startup-check-interval", 0, "Worker 实例就绪探测轮询周期秒数")
+	requestTimeoutSecsFlag := flag.Int("request-timeout-secs", 0, "vllm-router 单次推理请求超时时间秒数 (--request-timeout-secs)")
 
 	extraArgsFlag := flag.String("extra-args", "", "vllm-router 额外自定义 CLI 参数 (空格分隔)")
 
@@ -269,6 +270,9 @@ func main() {
 		}
 		if !explicitFlags["worker-startup-check-interval"] && fileCfg.Router.WorkerStartupCheckInterval != nil {
 			*workerStartupCheckIntervalFlag = *fileCfg.Router.WorkerStartupCheckInterval
+		}
+		if !explicitFlags["request-timeout-secs"] && fileCfg.Router.RequestTimeoutSecs != nil {
+			*requestTimeoutSecsFlag = *fileCfg.Router.RequestTimeoutSecs
 		}
 		if !explicitFlags["waiting-threshold"] && fileCfg.Router.WaitingThreshold != nil {
 			*waitingThreshFlag = *fileCfg.Router.WaitingThreshold
@@ -519,6 +523,7 @@ func main() {
 		MaxPayloadSize:             *maxPayloadSizeFlag,
 		WorkerStartupTimeoutSecs:   *workerStartupTimeoutFlag,
 		WorkerStartupCheckInterval: *workerStartupCheckIntervalFlag,
+		RequestTimeoutSecs:         *requestTimeoutSecsFlag,
 	}
 
 	if fileCfg != nil {
@@ -566,6 +571,16 @@ func main() {
 		}
 		if fileCfg.CircuitBreaker.RetryInitialBackoff > 0 {
 			routerCfg.RetryInitialBackoffMs = int(fileCfg.CircuitBreaker.RetryInitialBackoff.Milliseconds())
+		}
+		if fileCfg.CircuitBreaker.RetryMaxBackoff > 0 {
+			routerCfg.RetryMaxBackoffMs = int(fileCfg.CircuitBreaker.RetryMaxBackoff.Milliseconds())
+		}
+		if fileCfg.CircuitBreaker.RetryBackoffMultiplier != nil && *fileCfg.CircuitBreaker.RetryBackoffMultiplier > 0 {
+			routerCfg.RetryBackoffMultiplier = *fileCfg.CircuitBreaker.RetryBackoffMultiplier
+		}
+		if fileCfg.CircuitBreaker.RetryJitterFactor != nil && *fileCfg.CircuitBreaker.RetryJitterFactor >= 0 {
+			v := *fileCfg.CircuitBreaker.RetryJitterFactor
+			routerCfg.RetryJitterFactor = &v
 		}
 		if fileCfg.CircuitBreaker.HealthCheckInterval > 0 {
 			routerCfg.HealthCheckIntervalSecs = int(fileCfg.CircuitBreaker.HealthCheckInterval.Seconds())
@@ -741,6 +756,7 @@ func main() {
 			Backend:               *backendFlag,
 			LogLevel:              *logLevelFlag,
 			LogDir:                *logDirFlag,
+			BaseRouterCfg:         routerCfg,
 		}
 		if fileCfg != nil {
 			proxyCfg.AutoHeal = fileCfg.AutoHeal

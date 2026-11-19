@@ -451,4 +451,79 @@ models:
 	}
 }
 
+func TestLoadConfigWithTimeoutAndRetryFields(t *testing.T) {
+	yamlContent := `
+router:
+  mode: "run"
+  request_timeout_secs: 1800
+circuit_breaker:
+  enabled: true
+  max_retries: 4
+  retry_initial_backoff: 100ms
+  retry_max_backoff: 30s
+  retry_backoff_multiplier: 1.5
+  retry_jitter_factor: 0.25
+  disable_retries: true
+  disable_circuit_breaker: true
+models:
+  - model_name: "DeepSeek-R1"
+    mode: "run"
+    request_timeout_secs: 3600
+`
+	tmpFile := filepath.Join(t.TempDir(), "config.yaml")
+	if err := os.WriteFile(tmpFile, []byte(yamlContent), 0644); err != nil {
+		t.Fatalf("failed to write temp config: %v", err)
+	}
+
+	cfg, err := LoadConfig(tmpFile)
+	if err != nil {
+		t.Fatalf("LoadConfig failed: %v", err)
+	}
+
+	if cfg.Router.RequestTimeoutSecs == nil || *cfg.Router.RequestTimeoutSecs != 1800 {
+		t.Errorf("expected router.request_timeout_secs=1800, got %v", cfg.Router.RequestTimeoutSecs)
+	}
+	if cfg.CircuitBreaker.MaxRetries != 4 {
+		t.Errorf("expected max_retries=4, got %d", cfg.CircuitBreaker.MaxRetries)
+	}
+	if cfg.CircuitBreaker.RetryInitialBackoff != 100*time.Millisecond {
+		t.Errorf("expected retry_initial_backoff=100ms, got %v", cfg.CircuitBreaker.RetryInitialBackoff)
+	}
+	if cfg.CircuitBreaker.RetryMaxBackoff != 30*time.Second {
+		t.Errorf("expected retry_max_backoff=30s, got %v", cfg.CircuitBreaker.RetryMaxBackoff)
+	}
+	if cfg.CircuitBreaker.RetryBackoffMultiplier == nil || *cfg.CircuitBreaker.RetryBackoffMultiplier != 1.5 {
+		t.Errorf("expected retry_backoff_multiplier=1.5, got %v", cfg.CircuitBreaker.RetryBackoffMultiplier)
+	}
+	if cfg.CircuitBreaker.RetryJitterFactor == nil || *cfg.CircuitBreaker.RetryJitterFactor != 0.25 {
+		t.Errorf("expected retry_jitter_factor=0.25, got %v", cfg.CircuitBreaker.RetryJitterFactor)
+	}
+	if cfg.CircuitBreaker.DisableRetries == nil || !*cfg.CircuitBreaker.DisableRetries {
+		t.Errorf("expected disable_retries=true, got %v", cfg.CircuitBreaker.DisableRetries)
+	}
+	if cfg.CircuitBreaker.DisableCircuitBreaker == nil || !*cfg.CircuitBreaker.DisableCircuitBreaker {
+		t.Errorf("expected disable_circuit_breaker=true, got %v", cfg.CircuitBreaker.DisableCircuitBreaker)
+	}
+	if len(cfg.Models) != 1 || cfg.Models[0].RequestTimeoutSecs == nil || *cfg.Models[0].RequestTimeoutSecs != 3600 {
+		t.Errorf("expected model request_timeout_secs=3600, got %+v", cfg.Models)
+	}
+
+	// Verify explicit 0.0 retry_jitter_factor is parsed as non-nil 0.0
+	zeroJitterYAML := `
+circuit_breaker:
+  retry_jitter_factor: 0
+`
+	zeroFile := filepath.Join(t.TempDir(), "zero_jitter.yaml")
+	if err := os.WriteFile(zeroFile, []byte(zeroJitterYAML), 0644); err != nil {
+		t.Fatalf("failed to write zero jitter config: %v", err)
+	}
+	zeroCfg, err := LoadConfig(zeroFile)
+	if err != nil {
+		t.Fatalf("LoadConfig failed: %v", err)
+	}
+	if zeroCfg.CircuitBreaker.RetryJitterFactor == nil || *zeroCfg.CircuitBreaker.RetryJitterFactor != 0 {
+		t.Errorf("expected retry_jitter_factor=0, got %v", zeroCfg.CircuitBreaker.RetryJitterFactor)
+	}
+}
+
 
